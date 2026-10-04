@@ -72,7 +72,7 @@ Every key is optional and has a built-in default.
 │ envfile.rs   comment-preserving dotenv parser + upsert writer                │
 │ fsops.rs     size-capped reads, atomic writes, copy with conflict policy     │
 │ watch.rs     debounced recursive watcher (FSEvents / ReadDirectoryChangesW)  │
-│ plugins      dialog, opener, clipboard-manager, drag (CrabNebula)            │
+│ plugins      dialog, opener, clipboard-manager; `drag` crate (CrabNebula)    │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -110,8 +110,10 @@ These files hold secrets, so the webview gets as little power as possible.
 - **No `fs` plugin.** The frontend can't read or write arbitrary paths. All file I/O goes through EnvDeck's own commands.
 - **Scope guard.** Every command canonicalises the path (via `dunce`, so no `\\?\` prefixes on Windows) and requires it to be inside a scan root or the library (reads), or additionally a destination the user picked in a **native** folder dialog this session (writes). `..` escapes and symlink tricks fail the check. Destination grants live in memory only.
 - **Folder pickers run in Rust**, so a compromised page can't fabricate a "user picked this folder" grant.
-- **Capabilities** (`capabilities/default.json`) allow only: dialogs, clipboard text write, reveal-in-folder, opening `vscode://`, `vscode-insiders://`, `cursor://` and `windsurf://` file URLs, and drag-out. A strict CSP blocks remote scripts and network access from the page.
-- **Masking.** Values whose key looks secret (`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, `_KEY`, `DSN`, ...) or that are URLs with embedded passwords are masked in the table, source view and compare view until revealed (globally or per value). The reveal state is never persisted.
+- **Native actions that take a path run in Rust.** Reveal-in-folder (`reveal`), drag-out (`start_drag`, using CrabNebula's `drag` crate directly rather than its JS plugin) and the file-object clipboard go through EnvDeck commands, so their paths pass the same scope guard as reads.
+- **The manifest's scope can't be set from the page.** `save_manifest` accepts only non-scope settings (`include`, `excludeDirs`, `maxDepth`, `maxFileBytes`, `editor`). `roots` and `library` change only through the native pickers, `remove_folder`, or the user hand-editing the file and choosing Reload. Otherwise a compromised page could grant itself `~`.
+- **Capabilities** (`capabilities/default.json`) allow only: core defaults (events), clipboard text write, and opening `vscode://`, `vscode-insiders://`, `cursor://` and `windsurf://` file URLs. A strict CSP blocks remote scripts and network access from the page.
+- **Masking.** Values whose key looks secret (`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, `_KEY`, `DSN`, ...) or that are URLs with embedded passwords are masked in the table, source view and compare view until revealed (globally or per value). The reveal state is never persisted. Editing a file in the source view necessarily shows raw values: it's an explicit Edit mode with a warning banner, and values are masked again on leaving it.
 - Nothing is logged, and EnvDeck makes no network calls.
 
 ### Live updates (`watch.rs`)
@@ -126,20 +128,20 @@ This is the core job, so there are several routes, each matching a real habit:
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
 | **Copy contents** (⌘/Ctrl+⇧C)         | Text to clipboard                                                                                                                                | Paste into a new file in VS Code                                        |
 | **Copy file** (⌘/Ctrl+⇧F)             | Puts the _file itself_ on the OS clipboard (`clipboard-rs`: `NSPasteboard` file URLs on macOS, `CF_HDROP` on Windows)                            | ⌘V in Finder/Explorer, or paste into the VS Code explorer               |
-| **Drag handle**                       | Native drag-out via `tauri-plugin-drag`                                                                                                          | Drop the file onto a folder in the VS Code explorer, Finder or Explorer |
+| **Drag handle**                       | Native drag-out via the `drag` crate, started by the `start_drag` command after the scope check                                                  | Drop the file onto a folder in the VS Code explorer, Finder or Explorer |
 | **Copy to…**                          | Pick a project from the scan, the library, or Browse; rename; choose a conflict policy                                                           | "Give `web/` the same `.env` as `api/`, but back up the old one"        |
 | **Copy selected as…**                 | Selected (or all) variables formatted as `KEY=value`, `export` (bash/zsh), `$env:` (PowerShell), `set` (cmd.exe), JSON, or `docker run -e` flags | Paste into a terminal, CI secret UI, `launch.json` `env` block          |
 | **Send to**                           | Upsert selected variables into another dotenv file, keeping its comments and order                                                               | Promote three keys from `.env` to `.env.local`                          |
 | **Compare ▸ Add missing keys**        | Upsert keys present in the template/other file but missing here                                                                                  | Catch up after someone adds a key to `.env.example`                     |
 | **Create .env from template**         | `.env.example` → `.env` (refuses to overwrite)                                                                                                   | Fresh clone setup                                                       |
 | **Open in editor** (⌘/Ctrl+E)         | `vscode://file/<path>` via the opener plugin; works without `code` on PATH. `editor` in the manifest switches to Insiders, Cursor or Windsurf.   | Jump to the file                                                        |
-| **Copy path / relative path, Reveal** | Clipboard / `revealItemInDir`                                                                                                                    | Everything else                                                         |
+| **Copy path / relative path, Reveal** | Clipboard / `reveal` command (opener's reveal, called from Rust)                                                                                 | Everything else                                                         |
 
 ## 4. IPC surface
 
 | Command                                                               | Purpose                                                                     |
 | --------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `get_manifest`, `reload_manifest`, `save_manifest`                    | Read or write `~/.envdeck.json`                                             |
+| `get_manifest`, `reload_manifest`, `save_manifest`                    | Read or write `~/.envdeck.json` (`save_manifest`: non-scope keys only)      |
 | `add_folder(persist)`, `save_folder`, `remove_folder`                 | Native picker; saved vs session-only roots                                  |
 | `set_library`                                                         | Native picker for the library folder                                        |
 | `scan`                                                                | Walk all roots (on a blocking thread) and return files plus per-root status |
@@ -149,6 +151,7 @@ This is the core job, so there are several routes, each matching a real habit:
 | `pick_destination`, `copy_config(src, destDir, onConflict, fileName)` | Copy with policy                                                            |
 | `create_from_template`                                                | `.env.example` → `.env`                                                     |
 | `copy_files_to_clipboard(paths)`                                      | File-object clipboard                                                       |
+| `reveal(path)`, `start_drag(path)`                                    | Reveal in Finder/Explorer; native drag-out                                  |
 | event `configs-changed`                                               | Watcher push with changed paths                                             |
 
 Command argument and result types are mirrored as TypeScript types in `src/lib/ipc.ts`.
@@ -177,11 +180,12 @@ envdeck/
    └─ src/ commands.rs state.rs manifest.rs scan.rs envfile.rs fsops.rs watch.rs
 ```
 
-Key dependencies: `tauri` 2, `tauri-plugin-{dialog,opener,clipboard-manager}`, `tauri-plugin-drag` (CrabNebula), `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `dunce`, `dirs`, `serde`, `thiserror`; frontend `radix-ui`, `lucide-react`, `sonner`, Tailwind v4.
+Key dependencies: `tauri` 2, `tauri-plugin-{dialog,opener,clipboard-manager}`, `drag` (CrabNebula), `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `dunce`, `dirs`, `serde`, `thiserror`; frontend `radix-ui`, `lucide-react`, `sonner`, Tailwind v4.
 
 ## 7. Testing strategy
 
 - **Rust unit tests** for the risky parts: dotenv parsing (quotes, `export`, multi-line, inline comments), upsert preserving comments and CRLF, quoting round-trips, every copy conflict policy, scanner exclusion/grouping/kinds, and the scope guard rejecting `..` and out-of-root paths.
+- **Frontend unit tests (Vitest)** for the pure logic in `src/lib` (secret detection, masking, compare, clipboard/shell formats and their escaping). Grow them as that logic grows.
 - **UI in a browser** against mock IPC for fast iteration and screenshot tests.
 - **Native smoke test per OS** for what only works natively: drag-out, file-object clipboard, folder dialogs, reveal, `vscode://` links, watcher events.
 

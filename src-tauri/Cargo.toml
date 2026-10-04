@@ -1,9 +1,9 @@
 [package]
 name = "env-deck"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-edition = "2021"
+description = "Find, compare and copy local .env and config files"
+authors = ["Austin Pierson"]
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -20,9 +20,22 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+# Native drag-out, called from Rust (not the JS plugin) so paths pass the scope guard.
+drag = "2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+walkdir = "2"
+globset = "0.4"
+notify-debouncer-full = "0.5"
+clipboard-rs = "0.3"
+dunce = "1"
+dirs = "6"
 
+[dev-dependencies]
+tempfile = "3"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

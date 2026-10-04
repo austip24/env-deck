@@ -1,0 +1,5 @@
+# Keep the repo LF; CRLF test data is built in code, not checked in.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary

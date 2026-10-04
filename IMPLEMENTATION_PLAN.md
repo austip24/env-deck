@@ -5,19 +5,12 @@ ARCHITECTURE.md stays the source of truth for *what* to build; this file is the 
 it in, the details the architecture leaves open, and the checks that close each milestone.
 [AGENTS.md](AGENTS.md) rules apply throughout.
 
-## Starting point (2026-10-04)
+## Status
 
-The repo is the stock `create-tauri-app` React/TS template. Things that disagree with AGENTS.md:
-
-| Where | Now | Should be |
+| # | Milestone | Status |
 | --- | --- | --- |
-| repo | not a git repository | `git init`, first commit = scaffold as-is |
-| `src-tauri/Cargo.toml` | `edition = "2021"`, only `tauri-plugin-opener` | `edition = "2024"`, full crate list (M0) |
-| `tauri.conf.json` | `pnpm dev` / `pnpm build`, `csp: null`, 800×600, name `env-deck` | `npm run …`, strict CSP, ~1200×780 with min size, `EnvDeck` |
-| `package.json` | no Tailwind, shadcn, oxlint, plugins; no `dev:mock`, `lint`, `test:rust` | see M0 |
-| `src/` | greet demo, `App.css` | replaced in M5 |
-| `capabilities/default.json` | `opener:default` (too broad) | minimal set (M0, finalised in M9) |
-| `node_modules` | not installed | `npm install` |
+| M0 | Scaffold alignment | **done** (2026-10-04) |
+| M1–M9 | | not started |
 
 ## Milestones at a glance
 
@@ -34,64 +27,45 @@ The repo is the stock `create-tauri-app` React/TS template. Things that disagree
 | M8 | Live updates: `watch` | M4, M5 | S |
 | M9 | Hardening, packaging, CI, native smoke tests | all | M |
 
-Every milestone ends with the AGENTS.md gate: `npm run build`, `npm run lint`,
-`npm run test:rust`, clippy warning-free, `cargo fmt`. UI milestones also get a `dev:mock` pass
-in light and dark themes.
+Every milestone ends with the AGENTS.md gate: `npm run build` (includes the mock-IPC bundle
+check), `npm run lint`, `npm test`, `npm run test:rust`, clippy warning-free, `cargo fmt`.
+UI milestones also get a `dev:mock` pass in light and dark themes.
 
 ---
 
-## M0: Scaffold alignment
+## M0: Scaffold alignment (done)
 
-**Repo and config**
-- `git init`; commit the scaffold untouched so later diffs are readable.
-- `Cargo.toml`: `edition = "2024"`, `description`, `authors`; rename package/lib only if desired
-  (`env_deck_lib` is fine). Keep the release profile.
-- `tauri.conf.json`: `productName: "EnvDeck"`, `beforeDevCommand: "npm run dev"`,
-  `beforeBuildCommand: "npm run build"`, window `title: "EnvDeck"`, `width: 1200, height: 780,
-  minWidth: 820, minHeight: 520`, bundle `targets: ["app", "dmg", "nsis", "msi"]`.
-- CSP (no remote anything): `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
-  img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none';
-  frame-ancestors 'none'`. Tauri injects its own nonces/hashes; confirm `tauri dev` still loads.
-- `index.html`: title `EnvDeck`, drop `vite.svg`/`tauri.svg`/`react.svg` and `App.css`.
+What was done, for reference:
 
-**Dependencies**
-- Rust: `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `dunce`, `dirs`, `serde`
-  (derive), `serde_json`, `thiserror`, `tauri-plugin-dialog`, `tauri-plugin-clipboard-manager`,
-  `tauri-plugin-drag`, `tauri-plugin-opener`; dev: `tempfile`.
-- npm: `@tauri-apps/plugin-dialog` (only if the JS side needs it; pickers run in Rust, so probably
-  not), `@tauri-apps/plugin-clipboard-manager`, `@crabnebula/tauri-plugin-drag` (see decision D1),
-  `tailwindcss`, `@tailwindcss/vite`, `radix-ui`, `lucide-react`, `sonner`, `class-variance-authority`,
-  `clsx`, `tailwind-merge`, `tw-animate-css`; dev: `oxlint`, `@types/node`.
+- `git init` on `main`; first commit is the untouched `create-tauri-app` scaffold.
+  `.gitattributes` keeps the repo LF (CRLF test data is built in code, not checked in).
+- `Cargo.toml`: edition 2024; crates `tauri-plugin-{opener,dialog,clipboard-manager}`, `drag`
+  (CrabNebula, used from Rust per D1), `walkdir`, `globset`, `notify-debouncer-full` 0.5,
+  `clipboard-rs`, `dunce`, `dirs` 6, `serde`, `serde_json`, `thiserror` 2; dev `tempfile`.
+  `tauri-plugin-dialog` depends on the `tauri-plugin-fs` crate internally; it is never registered
+  and has no capability, so the webview still has no file access.
+- `tauri.conf.json`: `EnvDeck`, identifier `com.austi.envdeck` (D4), npm commands, 1200×780
+  (min 820×520), strict CSP (`connect-src ipc: http://ipc.localhost`, no remote origins),
+  bundle targets `app`, `dmg`, `nsis`, `msi`.
+- `capabilities/default.json`: `core:default`, `clipboard-manager:allow-write-text`,
+  `opener:allow-open-url` scoped to `vscode`/`vscode-insiders`/`cursor`/`windsurf` `://file/*`.
+- npm: `radix-ui`, `lucide-react`, `sonner`, `class-variance-authority`, `clsx`,
+  `tailwind-merge`, `@tauri-apps/plugin-clipboard-manager`; dev `tailwindcss`,
+  `@tailwindcss/vite`, `tw-animate-css`, `oxlint`, `@types/node`, `vitest`.
+- Scripts: `dev`, `dev:mock` (`vite --mode mock`), `build` (`tsc && vite build && node
+  scripts/check-bundle.mjs`), `lint` (`oxlint src scripts`), `test` (`vitest run`), `test:rust`.
+- `@/` alias (tsconfig `paths`, Vite `resolve.alias`); Tailwind v4 + `src/index.css` with
+  new-york neutral tokens, dark mode from `prefers-color-scheme`, custom `--success`/`--warning`;
+  `components.json`; `lib/utils.ts` (`cn`, with a Vitest test); `components/ui/sonner.tsx`.
+- `main.tsx` loads `dev/mock-ipc.ts` only when `import.meta.env.MODE === "mock"`;
+  `scripts/check-bundle.mjs` fails the build if the sentinel `__ENVDECK_MOCK_IPC__` is in `dist/`
+  (verified: it fails on a `--mode mock` build and passes on a normal one).
+- Rust: placeholder modules `error`, `state`, `manifest`, `scan`, `envfile`, `fsops`, `watch`,
+  `commands`; `lib.rs` registers the three plugins and an empty handler.
+- Template demo (`greet`, logos, `App.css`) removed; `App.tsx` is an empty sidebar + main shell.
 
-**Frontend tooling**
-- `@/` alias in `tsconfig.json` (`baseUrl`, `paths`) and `vite.config.ts` (`resolve.alias`); remove
-  the `@ts-expect-error` once `@types/node` is in.
-- Tailwind v4 via `@tailwindcss/vite`; `src/index.css` with shadcn new-york neutral tokens for
-  light and dark (`@media (prefers-color-scheme: dark)`, since the app follows the OS), plus the
-  custom `--success` and `--warning` tokens. `components.json` (new-york, neutral, `radix-ui`).
-- `src/lib/utils.ts` with `cn()`.
-- Scripts:
-  ```json
-  "dev": "vite",
-  "dev:mock": "vite --mode mock",
-  "build": "tsc && vite build && node scripts/check-bundle.mjs",
-  "lint": "oxlint src",
-  "test:rust": "npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
-  "tauri": "tauri"
-  ```
-- `scripts/check-bundle.mjs`: fails the build if `dist/` contains the mock IPC sentinel string
-  (`__ENVDECK_MOCK_IPC__`), enforcing "must never ship in the app bundle".
-
-**Rust skeleton**
-- `lib.rs` registers plugins and an empty `generate_handler![]`; add empty modules
-  `error`, `state`, `manifest`, `scan`, `envfile`, `fsops`, `watch`, `commands`.
-- `capabilities/default.json` initial set: `core:default`, `core:event:default`,
-  `clipboard-manager:allow-write-text`, `opener:allow-open-url` scoped to
-  `vscode://file/*`, `vscode-insiders://file/*`, `cursor://file/*`, `windsurf://file/*`
-  (drag/reveal per D1).
-
-**Done when:** `npm run tauri dev` opens an empty EnvDeck window on Windows, `dev:mock` serves,
-and the full gate passes.
+Verified on Windows: full gate passes; `npm run tauri dev` opens the "EnvDeck" window;
+`dev:mock` serves with the mock loaded. Not yet checked on macOS.
 
 ---
 
@@ -247,7 +221,7 @@ snake_case; Tauri exposes them camelCase to JS.
 | --- | --- |
 | `get_manifest() -> ManifestView` | resolved values, `~`-contracted display paths, config path, parse error if any |
 | `reload_manifest()` | re-read file, restart watcher |
-| `save_manifest(settings)` | **only non-scope keys** (`include`, `excludeDirs`, `maxDepth`, `maxFileBytes`, `editor`). Roots and library can be changed only via pickers / `remove_folder`, otherwise a compromised page could grant itself `~`. Update ARCHITECTURE.md §4 to say so. |
+| `save_manifest(settings)` | **only non-scope keys** (`include`, `excludeDirs`, `maxDepth`, `maxFileBytes`, `editor`). Roots and library can be changed only via pickers / `remove_folder`, otherwise a compromised page could grant itself `~`. (D2; documented in ARCHITECTURE.md.) |
 | `add_folder(persist) -> Option<String>` | `tauri-plugin-dialog` blocking picker run via `spawn_blocking` (lock not held); `persist` → append to manifest roots + save; else session root. Restart watcher. |
 | `save_folder(path)` | promote a session root (must already be one) to saved |
 | `remove_folder(path)` | remove from saved or session; save manifest if saved |
@@ -260,7 +234,7 @@ snake_case; Tauri exposes them camelCase to JS.
 | `copy_config(src, dest_dir, on_conflict, file_name?) -> CopyOutcome` | `file_name` validated (no separators) |
 | `create_from_template(path) -> String` | `.env.example` → `.env`, `example.env` → `.env`; `Exists` if present |
 | `copy_files_to_clipboard(paths)` | `clipboard-rs` `set_files`; run on the main thread via `app.run_on_main_thread` + channel (NSPasteboard / OLE clipboard expect it) |
-| `reveal(path)`, `start_drag(path)` | see D1 |
+| `reveal(path)`, `start_drag(path)` | D1: Rust-side, scope-checked; `start_drag` runs on the main thread |
 
 ### `src/lib/ipc.ts`
 - TS mirrors of every struct above and one typed wrapper per command (`invoke<T>("scan")`).
@@ -330,7 +304,7 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 - **Copy path / relative path**.
 - **Open in editor** (E): `openUrl(editorUrl(…))`; on failure toast "Is VS Code installed?".
 - **Reveal**, **Copy file** (⇧F) via commands from M4.
-- **Drag handle**: per D1.
+- **Drag handle**: `start_drag` command (D1); the handle calls it on `pointerdown`/drag start.
 - `hooks/use-copy.ts` centralises these and the toasts.
 - Native-only features (file clipboard, drag, reveal, editor URL) can't be verified in
   `dev:mock`; the mock just toasts. Record native checks in the M9 checklist.
@@ -395,31 +369,24 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 
 ---
 
-## Decisions needed before or during the build
+## Decisions (resolved 2026-10-04)
 
-**D1. Drag-out and reveal: JS plugin or Rust wrapper? (recommend: Rust wrapper)**
-`@crabnebula/tauri-plugin-drag` and the opener's `revealItemInDir` take any path from the
-webview, which sidesteps `ensure_within`. Wrapping them in `start_drag(path)` / `reveal(path)`
-commands (using the `drag` crate and `tauri_plugin_opener::reveal_item_in_dir`) keeps hard rule 3
-intact and lets the capability file drop `drag:default` and `opener:allow-reveal-item-in-dir`.
-Cost: `start_drag` needs the window handle and must run on the main thread; native drag can't
-start from an async command without that. Requires a one-line ARCHITECTURE.md update.
+- **D1. Drag-out and reveal run in Rust.** `start_drag(path)` (CrabNebula's `drag` crate,
+  started on the main thread with the window handle) and `reveal(path)`
+  (`tauri_plugin_opener::reveal_item_in_dir`) are EnvDeck commands that pass `ensure_within`.
+  No drag or reveal permission in the capability file; no `@crabnebula/tauri-plugin-drag` npm package.
+- **D2. `save_manifest` takes non-scope keys only** (`include`, `excludeDirs`, `maxDepth`,
+  `maxFileBytes`, `editor`). Roots and library change only via pickers, `remove_folder`, or a
+  hand edit + Reload.
+- **D3. Vitest** for pure frontend logic in `src/lib` (`*.test.ts` next to the module); tests are
+  added and updated as that logic grows (`lib/env.ts` in M5, `lib/platform.ts` URL/path helpers).
+- **D4. Naming:** product `EnvDeck`, identifier `com.austi.envdeck` (same namespace as the
+  scaffold's `com.austi.env-deck`, matching the product name). Treat it as fixed once a build is
+  distributed: changing it moves macOS app data/permissions and Windows install keys.
+- **D5. Edit mode** shows raw values behind an explicit Edit toggle with a warning banner; values
+  are masked again on exit.
 
-**D2. `save_manifest` scope (recommend: non-scope keys only).**
-As written in ARCHITECTURE.md §4 it could accept `roots`/`library` from the page, which would
-let a compromised page grant itself any folder. Restrict it as described in M4 and note it in
-ARCHITECTURE.md.
-
-**D3. Frontend unit tests (recommend: add Vitest for `lib/env.ts` only).**
-The shell-format escaping and secret detection are easy to get subtly wrong and aren't covered by
-the Rust tests. Adds one dev dependency and an `npm test` script; needs ARCHITECTURE.md §7 and
-AGENTS.md updated.
-
-**D4. Naming.** `productName: "EnvDeck"`; keep identifier `com.austi.env-deck` or pick a final
-one now (changing it after release moves macOS app data/permissions and Windows install keys).
-
-**D5. Edit mode and masking.** Editing necessarily shows raw values. Plan: explicit "Edit" with a
-warning banner, masked again on exit. Confirm that's acceptable.
+ARCHITECTURE.md and AGENTS.md were updated for D1–D3 and D5.
 
 ## Risks
 
@@ -432,4 +399,4 @@ warning banner, masked again on exit. Confirm that's acceptable.
   consider not watching it and showing "live updates off for this folder".
 - **mtime resolution:** network shares / FAT have coarse mtimes; a save within the same tick
   could miss a concurrent change. Acceptable for v1; could add size + hash later.
-- **Plugin version drift:** `tauri-plugin-drag` lags Tauri releases at times; pin versions in M0.
+- **Crate version drift:** `drag` and the Tauri plugins move with Tauri releases; `Cargo.lock` is committed, update deliberately.
