@@ -10,7 +10,9 @@ it in, the details the architecture leaves open, and the checks that close each 
 | # | Milestone | Status |
 | --- | --- | --- |
 | M0 | Scaffold alignment | **done** (2026-10-04) |
-| M1–M9 | | not started |
+| M1 | Rust foundations | **done** (2026-10-04) |
+| M2 | dotenv engine | **done** (2026-10-04) |
+| M3–M9 | | not started |
 
 ## Milestones at a glance
 
@@ -69,7 +71,19 @@ Verified on Windows: full gate passes; `npm run tauri dev` opens the "EnvDeck" w
 
 ---
 
-## M1: Rust foundations
+## M1: Rust foundations (done)
+
+Notes from implementation (beyond the spec below):
+- `Error` variants carry the path; `Error::io(path, e)` maps `NotFound`. `Stale` and `Exists`
+  messages start with `STALE: ` / `EXISTS: ` for `errorText` to match. Added `InvalidDotenv`.
+- The manifest keeps unknown keys (`extra`, flattened) so hand-added keys survive a save.
+  `SettingsUpdate` (`deny_unknown_fields`, no `roots`/`library`) is the `save_manifest` payload (D2).
+- `Inner` holds `config_path` and `home` too; the watcher handle is added in M8.
+- `fsops::set_env_vars` (dotenv-name check + upsert + atomic write, keeps BOM) is shared by
+  the `set_env_vars` command and the `merge` policy.
+- Backups use `<name>.bak-<secs>`, then `-2`, ... so two in the same second don't collide.
+- The symlink scope test uses a junction on Windows (no Developer Mode needed), so it runs on both OSes.
+- `lib.rs` has `#[allow(dead_code)]` on the core modules until M4 wires them into commands.
 
 ### `error.rs`
 `thiserror` enum, serialised to a **string** for the UI (`impl Serialize` → `to_string()`):
@@ -145,7 +159,12 @@ parse that in `errorText` rather than switching to an object payload.
 
 ---
 
-## M2: dotenv engine (`envfile.rs`)
+## M2: dotenv engine (`envfile.rs`) (done)
+
+Notes from implementation: `upsert` keeps each untouched line's own terminator (mixed files
+stay byte-identical) and refuses files with an unterminated quote, since appended keys would land
+inside it. `#` starts an inline comment only after whitespace (`COLOR=#fff` is a value).
+`Parsed::vars()` gives last-wins values in first-appearance order. `is_dotenv_name` lives here.
 
 Can be built in parallel with M1; pure functions, no I/O.
 

@@ -1,9 +1,16 @@
+// TODO(M4): remove these `allow`s once commands.rs uses the core modules; until then only
+// tests do.
 mod commands;
+#[allow(dead_code)]
 mod envfile;
+#[allow(dead_code)]
 mod error;
+#[allow(dead_code)]
 mod fsops;
+#[allow(dead_code)]
 mod manifest;
 mod scan;
+#[allow(dead_code)]
 mod state;
 mod watch;
 

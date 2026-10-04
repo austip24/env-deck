@@ -47,7 +47,7 @@ Example `~/.envdeck.json`:
 }
 ```
 
-Every key is optional and has a built-in default.
+Every key is optional and has a built-in default. Keys EnvDeck doesn't recognise are kept when it saves the file, and a file it can't parse is reported and never overwritten.
 
 ## 2. Component map
 
@@ -98,7 +98,7 @@ One parser shared by viewing, comparing and writing, covering the dialect used b
 
 ### Writes are safe by construction (`fsops.rs`)
 
-- **Atomic:** write to `.<name>.envdeck-tmp` in the same folder, then `rename` (which replaces on Windows too). A crash never leaves half a `.env`.
+- **Atomic:** write to `.<name>.envdeck-tmp` in the same folder, then `rename` (which replaces on Windows too, with a short retry if an editor or virus scanner holds the file). A crash never leaves half a `.env`. A symlinked file is written through to its target, Unix permissions (e.g. `600`) are kept, and a UTF-8 BOM (common in Visual Studio's `appsettings.json`) is preserved.
 - **No silent overwrite:** copy takes an explicit policy: `fail` (default), `backup` (`<name>.bak-<unix>`), `keepBoth` (`<name>.copy`), `merge` (dotenv upsert), `overwrite`.
 - **Optimistic concurrency:** the editor sends the mtime it loaded. If the file changed on disk since then, the save is refused with a "reload first" error.
 - **Size cap:** reads over `maxFileBytes` (512 KB default) or non-UTF-8 files are refused, so a stray binary can't freeze the UI.
