@@ -80,7 +80,8 @@ Every key is optional and has a built-in default. Keys EnvDeck doesn't recognise
 
 - Walks each root with `walkdir` (no symlink following, `maxDepth` 8 by default) and **prunes** `excludeDirs` before descending, so `node_modules` and friends cost nothing.
 - Deliberately does **not** honour `.gitignore`: `.env` files are almost always git-ignored, which is exactly why they need a tool.
-- Matches `include` globs with `globset`. Every pattern is anchored with `**/`, so `.env.*` and `.vscode/launch.json` match at any depth (monorepos work).
+- Matches `include` globs with `globset`, case-insensitively. Every pattern is anchored with `**/`, so `.env.*` and `.vscode/launch.json` match at any depth (monorepos work); a pattern starting with `/` matches only at the root.
+- Symlinked files are listed only when they resolve to a file inside the same root (the scope guard would refuse anything else). When roots are nested (a library inside a scanned folder), each file is listed once, under the most specific root.
 - Groups each file under its **project**: the nearest ancestor with a marker (`.git`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `global.json`, `Directory.Build.props`, `pom.xml`, `build.gradle`, `composer.json`, `Gemfile`, `deno.json`). Lookups are cached per directory; with no marker, the file's own folder is the project.
 - Classifies kind: `env`, `env-template` (`example|sample|template|dist|defaults`), `json`, `yaml`, `toml`, `ini`, `text`.
 - Caps at 5,000 files and reports `truncated` so a mis-pointed root (`~`) degrades gracefully.

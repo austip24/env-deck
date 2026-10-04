@@ -12,7 +12,8 @@ it in, the details the architecture leaves open, and the checks that close each 
 | M0 | Scaffold alignment | **done** (2026-10-04) |
 | M1 | Rust foundations | **done** (2026-10-04) |
 | M2 | dotenv engine | **done** (2026-10-04) |
-| M3–M9 | | not started |
+| M3 | Scanner | **done** (2026-10-04) |
+| M4–M9 | | not started |
 
 ## Milestones at a glance
 
@@ -198,7 +199,24 @@ Can be built in parallel with M1; pure functions, no I/O.
 
 ---
 
-## M3: Scanner (`scan.rs`)
+## M3: Scanner (`scan.rs`) (done)
+
+Notes from implementation (beyond the spec below):
+- Signature is `scan(roots: &[RootSpec], settings: &Settings, home) -> ScanResult`. Invalid
+  include patterns are skipped and reported in `ScanResult.warnings` rather than failing a root.
+- Globs are case-insensitive (`AppSettings.json` on Windows) and `*` doesn't cross `/`. A pattern
+  starting with `/` is anchored to the root instead of getting `**/`.
+- `ConfigFile` also has `projectRelPath` (project relative to root) so two projects both called
+  `web` can be told apart; `relPath` is relative to the project.
+- `RootStatus` also has `library`, `skipped` (unreadable entries) and `truncated` (per root,
+  for M8/M9: don't watch a truncated root).
+- Nested roots (e.g. library inside a scanned folder): each file is listed once, under the most
+  specific root. Output keeps the caller's root order.
+- Symlinked files are listed only if they resolve to a file inside the same root (otherwise the
+  scope guard would refuse to read them). Symlinked dirs aren't followed.
+- `scan::Matcher` (`is_included`, `in_excluded_dir`) is shared with the watcher in M8.
+- Measured on Windows (debug build): `~` in 1.3 s (54 files), `C:\dev` 80 ms (release). An
+  ignored test `scan_real` repeats this: `ENVDECK_SCAN_ROOT=~ cargo test scan_real -- --ignored --nocapture`.
 
 - `scan(roots: &[RootSpec], cfg: &Resolved) -> ScanResult` (pure over the file system; the
   command wraps it in `spawn_blocking`).

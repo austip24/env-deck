@@ -9,6 +9,7 @@ mod error;
 mod fsops;
 #[allow(dead_code)]
 mod manifest;
+#[allow(dead_code)]
 mod scan;
 #[allow(dead_code)]
 mod state;
