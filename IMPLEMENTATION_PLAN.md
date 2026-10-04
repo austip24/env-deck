@@ -13,7 +13,8 @@ it in, the details the architecture leaves open, and the checks that close each 
 | M1 | Rust foundations | **done** (2026-10-04) |
 | M2 | dotenv engine | **done** (2026-10-04) |
 | M3 | Scanner | **done** (2026-10-04) |
-| M4–M9 | | not started |
+| M4 | IPC surface | **done** (2026-10-04) |
+| M5–M9 | | not started |
 
 ## Milestones at a glance
 
@@ -248,7 +249,29 @@ Notes from implementation (beyond the spec below):
 
 ---
 
-## M4: IPC surface
+## M4: IPC surface (done)
+
+Notes from implementation (beyond the spec below):
+- All commands are `async` (Tauri runs sync commands on the main thread). Pickers run
+  `blocking_pick_folder` on a blocking thread, parented to the window, starting in `~`.
+- `update_manifest` changes a copy, saves it, and only then swaps it in; it refuses while the
+  config file is unparseable (`ManifestView.error`), so a broken hand-edit is never clobbered.
+  Startup only reads `~/.envdeck.json` (verified: nothing is created on launch).
+- `remove_folder` also clears the library when given its path. `set_env_vars` validates keys
+  (`envfile::is_valid_key`). `create_from_template` uses `envfile::template_target`
+  (`.env.local.sample` -> `.env.local`) with the `fail` policy.
+- Native actions: `copy_files_to_clipboard` runs `clipboard-rs` on the main thread and waits for
+  the result; `start_drag` uses the `drag` crate on the main thread (fire-and-forget, since the
+  Windows drag loop lasts until the drop) with the 32px app icon as the drag image; `reveal`
+  calls `tauri_plugin_opener::reveal_item_in_dir`. Failures are `Error::Native`.
+- `manifest::expand`/`contract` take the home dir explicitly (renamed from `*_with`).
+- TS: `lib/ipc.ts` exports the mirrored types, an `ipc` object of wrappers, `onConfigsChanged`,
+  and `errorText`/`errorCode` (strips/reads the `STALE:`/`EXISTS:` prefix).
+- Mock: `dev/mock-ipc.ts` (in-memory tree: monorepo with web/api, CRLF + PEM + invalid line,
+  appsettings, launch.json, compose, blog with `.npmrc`, library, a "picked" scratch folder) and
+  `dev/mock-dotenv.ts` (port of the parser/upsert). Vitest covers the port against the Rust cases
+  and drives `lib/ipc.ts` through the mock (arg names and shapes stay in step).
+- Not yet exercised natively: pickers, file clipboard, drag, reveal (UI arrives in M5/M6).
 
 ### `commands.rs`
 Every path argument goes through `state::ensure_within` before use. Rust param names are

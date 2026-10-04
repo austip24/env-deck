@@ -185,12 +185,12 @@ impl Manifest {
         self.roots
             .iter()
             .flatten()
-            .map(|r| expand_with(r, home))
+            .map(|r| expand(r, home))
             .collect()
     }
 
     pub fn library_path(&self, home: Option<&Path>) -> Option<PathBuf> {
-        self.library.as_deref().map(|l| expand_with(l, home))
+        self.library.as_deref().map(|l| expand(l, home))
     }
 
     /// Adds a saved root (stored `~`-relative). Returns false if it was already there.
@@ -200,7 +200,7 @@ impl Manifest {
         }
         self.roots
             .get_or_insert_with(Vec::new)
-            .push(contract_with(path, home));
+            .push(contract(path, home));
         true
     }
 
@@ -210,12 +210,12 @@ impl Manifest {
             return false;
         };
         let before = roots.len();
-        roots.retain(|r| !same_path(&expand_with(r, home), path));
+        roots.retain(|r| !same_path(&expand(r, home), path));
         roots.len() != before
     }
 
     pub fn set_library(&mut self, path: &Path, home: Option<&Path>) {
-        self.library = Some(contract_with(path, home));
+        self.library = Some(contract(path, home));
     }
 }
 
@@ -244,7 +244,7 @@ pub fn config_path() -> Result<PathBuf> {
 
 fn config_path_from(env: Option<PathBuf>, home: Option<&Path>) -> Result<PathBuf> {
     match (env, home) {
-        (Some(p), _) if !p.as_os_str().is_empty() => Ok(expand_with(&p.to_string_lossy(), home)),
+        (Some(p), _) if !p.as_os_str().is_empty() => Ok(expand(&p.to_string_lossy(), home)),
         (_, Some(h)) => Ok(h.join(FILE_NAME)),
         _ => Err(Error::Manifest(
             "can't find the home folder; set ENVDECK_CONFIG".into(),
@@ -275,16 +275,8 @@ pub fn save(path: &Path, manifest: &Manifest) -> Result<()> {
     fsops::write_atomic(path, json.as_bytes())
 }
 
-pub fn expand(s: &str) -> PathBuf {
-    expand_with(s, home().as_deref())
-}
-
-pub fn contract(path: &Path) -> String {
-    contract_with(path, home().as_deref())
-}
-
 /// Expands a leading `~`, `~/` or `~\` against `home`.
-pub fn expand_with(s: &str, home: Option<&Path>) -> PathBuf {
+pub fn expand(s: &str, home: Option<&Path>) -> PathBuf {
     let Some(home) = home else {
         return PathBuf::from(s);
     };
@@ -302,7 +294,7 @@ pub fn expand_with(s: &str, home: Option<&Path>) -> PathBuf {
 
 /// `~`-relative form of `path` with `/` separators when it's inside `home`; otherwise the
 /// native path unchanged.
-pub fn contract_with(path: &Path, home: Option<&Path>) -> String {
+pub fn contract(path: &Path, home: Option<&Path>) -> String {
     if let Some(home) = home
         && let Ok(rest) = strip_prefix_ci(path, home)
     {
@@ -449,35 +441,32 @@ mod tests {
     fn expand_handles_both_separators() {
         let home = home_dir();
         let h = Some(home.as_path());
-        assert_eq!(expand_with("~", h), home);
-        assert_eq!(expand_with("~/code/api", h), home.join("code").join("api"));
-        assert_eq!(expand_with(r"~\code\api", h), home.join("code").join("api"));
-        assert_eq!(expand_with("~other/x", h), PathBuf::from("~other/x"));
-        assert_eq!(expand_with("/abs/path", h), PathBuf::from("/abs/path"));
-        assert_eq!(expand_with("~/x", None), PathBuf::from("~/x"));
+        assert_eq!(expand("~", h), home);
+        assert_eq!(expand("~/code/api", h), home.join("code").join("api"));
+        assert_eq!(expand(r"~\code\api", h), home.join("code").join("api"));
+        assert_eq!(expand("~other/x", h), PathBuf::from("~other/x"));
+        assert_eq!(expand("/abs/path", h), PathBuf::from("/abs/path"));
+        assert_eq!(expand("~/x", None), PathBuf::from("~/x"));
     }
 
     #[test]
     fn contract_uses_forward_slashes_inside_home() {
         let home = home_dir();
         let h = Some(home.as_path());
-        assert_eq!(contract_with(&home, h), "~");
-        assert_eq!(
-            contract_with(&home.join("code").join("api"), h),
-            "~/code/api"
-        );
+        assert_eq!(contract(&home, h), "~");
+        assert_eq!(contract(&home.join("code").join("api"), h), "~/code/api");
         let outside = if cfg!(windows) {
             PathBuf::from(r"D:\work\clients")
         } else {
             PathBuf::from("/opt/work")
         };
-        assert_eq!(contract_with(&outside, h), outside.to_string_lossy());
+        assert_eq!(contract(&outside, h), outside.to_string_lossy());
         // Sibling with a shared prefix is not inside home.
         let sibling = PathBuf::from(format!("{}2", home.display())).join("x");
-        assert_eq!(contract_with(&sibling, h), sibling.to_string_lossy());
+        assert_eq!(contract(&sibling, h), sibling.to_string_lossy());
         // Round trip.
         let p = home.join("dev-configs");
-        assert_eq!(expand_with(&contract_with(&p, h), h), p);
+        assert_eq!(expand(&contract(&p, h), h), p);
     }
 
     #[cfg(windows)]
@@ -485,7 +474,7 @@ mod tests {
     fn contract_is_case_insensitive_on_windows() {
         let home = home_dir();
         assert_eq!(
-            contract_with(Path::new(r"c:\users\DEV\code"), Some(&home)),
+            contract(Path::new(r"c:\users\DEV\code"), Some(&home)),
             "~/code"
         );
     }

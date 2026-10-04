@@ -1,17 +1,9 @@
-// TODO(M4): remove these `allow`s once commands.rs uses the core modules; until then only
-// tests do.
 mod commands;
-#[allow(dead_code)]
 mod envfile;
-#[allow(dead_code)]
 mod error;
-#[allow(dead_code)]
 mod fsops;
-#[allow(dead_code)]
 mod manifest;
-#[allow(dead_code)]
 mod scan;
-#[allow(dead_code)]
 mod state;
 mod watch;
 
@@ -21,7 +13,29 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .invoke_handler(tauri::generate_handler![])
+        .setup(|app| {
+            commands::init_state(app.handle());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_manifest,
+            commands::reload_manifest,
+            commands::save_manifest,
+            commands::add_folder,
+            commands::save_folder,
+            commands::remove_folder,
+            commands::set_library,
+            commands::scan,
+            commands::read_config,
+            commands::write_config,
+            commands::set_env_vars,
+            commands::pick_destination,
+            commands::copy_config,
+            commands::create_from_template,
+            commands::copy_files_to_clipboard,
+            commands::reveal,
+            commands::start_drag,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -136,6 +136,41 @@ pub fn is_dotenv_name(name: &str) -> bool {
     name == ".env" || name.starts_with(".env.") || (name.ends_with(".env") && name.len() > 4)
 }
 
+/// True for keys the parser accepts: `[A-Za-z_][A-Za-z0-9_.-]*`.
+pub fn is_valid_key(key: &str) -> bool {
+    key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+const TEMPLATE_WORDS: &[&str] = &["example", "sample", "template", "dist", "defaults"];
+
+/// True if a dotenv file name marks a template (`.env.example`, `sample.env`, ...).
+pub fn is_template_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_dotenv_name(&lower) && lower.split('.').any(|seg| TEMPLATE_WORDS.contains(&seg))
+}
+
+/// The file a template should become: `.env.example` -> `.env`,
+/// `.env.local.sample` -> `.env.local`, `example.env` -> `.env`, `dev.example.env` -> `dev.env`.
+pub fn template_target(name: &str) -> Option<String> {
+    if !is_template_name(name) {
+        return None;
+    }
+    let kept: Vec<&str> = name
+        .split('.')
+        .filter(|seg| !TEMPLATE_WORDS.contains(&seg.to_ascii_lowercase().as_str()))
+        .collect();
+    let target = kept.join(".");
+    let target = if target.eq_ignore_ascii_case("env") {
+        ".env".to_string()
+    } else {
+        target
+    };
+    is_dotenv_name(&target).then_some(target)
+}
+
 const UNTERMINATED: &str = "unterminated quoted value";
 
 /// A physical line: content without its terminator, and the terminator (`""` on the last line
@@ -242,7 +277,7 @@ fn parse_entry(raw: &[RawLine], i: usize) -> (Line, usize) {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'))
         .unwrap_or(rest.len());
     let key = &rest[..key_len];
-    if !key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+    if !is_valid_key(key) {
         return other("expected KEY=value");
     }
     let after_key = rest[key_len..].trim_start_matches(is_blank_char);
@@ -771,6 +806,31 @@ mod tests {
     fn upsert_with_no_changes_is_byte_identical() {
         let text = "# c\r\n\r\nexport A='x' # y\nB=\"m\nl\"\nbad\n";
         assert_eq!(upsert(text, &[]).unwrap(), text);
+    }
+
+    #[test]
+    fn keys_and_templates() {
+        assert!(is_valid_key("A_B.c-d") && is_valid_key("_x"));
+        assert!(
+            !is_valid_key("")
+                && !is_valid_key("1A")
+                && !is_valid_key("A B")
+                && !is_valid_key("A=B")
+        );
+        let cases = [
+            (".env.example", Some(".env")),
+            (".env.local.sample", Some(".env.local")),
+            (".ENV.Template", Some(".ENV")),
+            ("example.env", Some(".env")),
+            ("dev.example.env", Some("dev.env")),
+            (".env.dist", Some(".env")),
+            (".env", None),
+            (".env.local", None),
+            ("appsettings.example.json", None),
+        ];
+        for (name, target) in cases {
+            assert_eq!(template_target(name).as_deref(), target, "{name}");
+        }
     }
 
     #[test]

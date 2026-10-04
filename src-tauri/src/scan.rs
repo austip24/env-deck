@@ -12,7 +12,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
 
-use crate::envfile::is_dotenv_name;
+use crate::envfile::{is_dotenv_name, is_template_name};
 use crate::manifest::{self, Settings};
 use crate::state::RootSpec;
 
@@ -34,8 +34,6 @@ pub const PROJECT_MARKERS: &[&str] = &[
     "Gemfile",
     "deno.json",
 ];
-
-const TEMPLATE_WORDS: &[&str] = &["example", "sample", "template", "dist", "defaults"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -165,6 +163,7 @@ impl Matcher {
     }
 
     /// True if any component of `rel` (a path relative to a root) is an excluded directory.
+    #[allow(dead_code)] // TODO(M8): used by the watcher
     pub fn in_excluded_dir(&self, rel: &Path) -> bool {
         let mut components = rel.components().peekable();
         while let Some(c) = components.next() {
@@ -186,7 +185,7 @@ impl Matcher {
 pub fn kind_of(name: &str) -> FileKind {
     let lower = name.to_ascii_lowercase();
     if is_dotenv_name(&lower) {
-        return if lower.split('.').any(|seg| TEMPLATE_WORDS.contains(&seg)) {
+        return if is_template_name(&lower) {
             FileKind::EnvTemplate
         } else {
             FileKind::Env
@@ -284,7 +283,7 @@ fn scan_with_cap(
         let spec = &roots[i];
         let mut status = RootStatus {
             path: spec.path.clone(),
-            display: manifest::contract_with(&spec.path, home),
+            display: manifest::contract(&spec.path, home),
             saved: spec.saved,
             library: spec.library,
             status: RootState::Ok,
@@ -735,7 +734,7 @@ mod tests {
             return;
         };
         let home = manifest::home();
-        let path = manifest::expand_with(&dir.to_string_lossy(), home.as_deref());
+        let path = manifest::expand(&dir.to_string_lossy(), home.as_deref());
         let result = scan(&[root(&path)], &settings(), home.as_deref());
         eprintln!(
             "{} files, truncated={}, skipped={}, {} ms",

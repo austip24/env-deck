@@ -33,6 +33,9 @@ pub enum Error {
     InvalidName(String),
     #[error("Couldn't use the EnvDeck config file: {0}")]
     Manifest(String),
+    /// A native facility (dialog, clipboard, drag, reveal) failed.
+    #[error("{0}")]
+    Native(String),
 }
 
 impl Error {
