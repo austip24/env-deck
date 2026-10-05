@@ -4,6 +4,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 // --- manifest ---------------------------------------------------------------------------------
 
@@ -136,6 +138,65 @@ export interface CopyOutcome {
   backupPath: string | null;
 }
 
+// --- GitHub (github.rs) ----------------------------------------------------------------------
+
+export interface GithubRemote {
+  /** The git remote's name (`origin`). */
+  remote: string;
+  host: string;
+  owner: string;
+  name: string;
+}
+
+export interface GithubRepoInfo {
+  /** GitHub remotes of the repository next to the file, `origin` first. */
+  remotes: GithubRemote[];
+}
+
+export interface GithubNames {
+  secrets: string[];
+  variables: string[];
+}
+
+/** What already exists on GitHub. Names only: values are never fetched. */
+export interface GithubState {
+  /** `owner/name`. */
+  repo: string;
+  environments: string[];
+  repoNames: GithubNames;
+  envNames: Record<string, GithubNames>;
+  warnings: string[];
+}
+
+/** Sign-in state (github_auth.rs). The token itself never reaches the webview. */
+export interface GithubAccount {
+  /** This build has a GitHub OAuth client ID. */
+  configured: boolean;
+  login: string | null;
+}
+
+/** OAuth Device Flow: the code to enter at `verificationUri`. */
+export interface GithubDeviceLogin {
+  userCode: string;
+  verificationUri: string;
+  /** Seconds. */
+  expiresIn: number;
+}
+
+export type GithubKind = "secret" | "variable";
+
+export interface GithubPushItem {
+  key: string;
+  kind: GithubKind;
+  /** null for the repository itself. */
+  environment: string | null;
+}
+
+export interface GithubPushResult extends GithubPushItem {
+  /** null on success. */
+  error: string | null;
+}
+
 // --- commands ---------------------------------------------------------------------------------
 
 export const ipc = {
@@ -171,6 +232,32 @@ export const ipc = {
   reveal: (path: string) => invoke<void>("reveal", { path }),
   /** Call from a pointer-down / drag-start handler. */
   startDrag: (path: string) => invoke<void>("start_drag", { path }),
+
+  /** GitHub sign-in (OAuth Device Flow); the token stays in Rust memory. */
+  githubAccount: () => invoke<GithubAccount>("github_account"),
+  /** Starts sign-in: returns the code and opens github.com/login/device from Rust. */
+  githubSignInStart: () => invoke<GithubDeviceLogin>("github_sign_in_start"),
+  /** Resolves once the code is approved; rejects (GH_AUTH) if it expires or is cancelled. */
+  githubSignInWait: () => invoke<GithubAccount>("github_sign_in_wait"),
+  githubOpenVerification: () => invoke<void>("github_open_verification"),
+  /** Forgets the in-memory token; also cancels a sign-in in progress. */
+  githubSignOut: () => invoke<GithubAccount>("github_sign_out"),
+  /** GitHub remotes of the repo whose `.git` is next to this dotenv file (NO_REPO if none). */
+  githubRepo: (path: string) => invoke<GithubRepoInfo>("github_repo", { path }),
+  /** Runs `gh` with the session's sign-in: environments and existing names. GH_AUTH when signed out. */
+  githubInspect: (path: string, remote: string) => invoke<GithubState>("github_inspect", { path, remote }),
+  /** Sets each item from the file's current value (read by Rust); results are per item. */
+  githubPush: (path: string, remote: string, items: GithubPushItem[]) =>
+    invoke<GithubPushResult[]>("github_push", { path, remote, items }),
+  /** Opens the EnvDeck GitHub App's install page or the repo's environment settings (URL built in Rust). */
+  githubOpenPage: (path: string, remote: string, page: "install" | "environments") =>
+    invoke<void>("github_open_page", { path, remote, page }),
+
+  // Plugin calls (permissions in capabilities/default.json).
+  /** Plain text to the clipboard (clipboard-manager:allow-write-text). */
+  writeClipboardText: (text: string) => writeText(text),
+  /** Editor `://file/` URLs only; the opener scope rejects anything else. */
+  openEditorUrl: (url: string) => openUrl(url),
 };
 
 /** Watcher push (M8): paths that changed on disk. */
@@ -181,9 +268,16 @@ export function onConfigsChanged(cb: (paths: string[]) => void): Promise<Unliste
 // --- errors -----------------------------------------------------------------------------------
 
 /** Stable prefixes Rust puts on errors the UI reacts to (see error.rs). */
-export type ErrorCode = "STALE" | "EXISTS";
+export type ErrorCode =
+  | "STALE"
+  | "EXISTS"
+  | "GH_MISSING"
+  | "GH_AUTH"
+  | "GH_NO_CLIENT"
+  | "GH_NOT_INSTALLED"
+  | "NO_REPO";
 
-const CODE_RE = /^(STALE|EXISTS): /;
+const CODE_RE = /^(STALE|EXISTS|GH_MISSING|GH_AUTH|GH_NO_CLIENT|GH_NOT_INSTALLED|NO_REPO): /;
 
 export function errorCode(e: unknown): ErrorCode | null {
   const m = CODE_RE.exec(rawError(e));

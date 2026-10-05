@@ -2,6 +2,8 @@ mod commands;
 mod envfile;
 mod error;
 mod fsops;
+mod github;
+mod github_auth;
 mod manifest;
 mod scan;
 mod state;
@@ -35,6 +37,15 @@ pub fn run() {
             commands::copy_files_to_clipboard,
             commands::reveal,
             commands::start_drag,
+            commands::github_repo,
+            commands::github_inspect,
+            commands::github_push,
+            commands::github_account,
+            commands::github_sign_in_start,
+            commands::github_sign_in_wait,
+            commands::github_open_verification,
+            commands::github_sign_out,
+            commands::github_open_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

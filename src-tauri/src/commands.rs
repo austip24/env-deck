@@ -1,10 +1,11 @@
 //! The IPC surface. Every path from the webview goes through `state::ensure_within` before any
-//! file access, including native actions (reveal, drag-out, file clipboard).
+//! file access, including native actions (reveal, drag-out, file clipboard) and the GitHub push.
 //!
 //! All commands are `async` so Tauri runs them off the main thread. None holds the state lock
 //! across an `.await` or a dialog: they copy what they need out of it first.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
@@ -13,9 +14,12 @@ use tauri_plugin_dialog::DialogExt;
 use crate::envfile::{self, LineEnding, Parsed};
 use crate::error::{Error, Result};
 use crate::fsops::{self, CopyOutcome, OnConflict};
+use crate::github;
+use crate::github_auth::{self, Poll, Token, TokenState};
 use crate::manifest::{self, Manifest, Settings, SettingsUpdate};
 use crate::scan::{self, FileKind, ScanResult};
 use crate::state::{AppState, Inner, ensure_within};
+use crate::watch;
 
 // ---------------------------------------------------------------------------------------------
 // Manifest and folders
@@ -116,24 +120,24 @@ pub async fn get_manifest(state: State<'_, AppState>) -> Result<ManifestView> {
 }
 
 #[tauri::command]
-pub async fn reload_manifest(state: State<'_, AppState>) -> Result<ManifestView> {
-    let mut inner = state.lock();
-    load_state(&mut inner);
-    // TODO(M8): watch::restart
-    Ok(manifest_view(&inner))
+pub async fn reload_manifest(app: AppHandle, state: State<'_, AppState>) -> Result<ManifestView> {
+    load_state(&mut state.lock());
+    watch::restart(&app);
+    Ok(manifest_view(&state.lock()))
 }
 
 /// Saves non-scope settings only. `roots` and `library` aren't accepted here (see
 /// [`SettingsUpdate`]), so the page can't grant itself access to more folders.
 #[tauri::command]
 pub async fn save_manifest(
+    app: AppHandle,
     state: State<'_, AppState>,
     settings: SettingsUpdate,
 ) -> Result<ManifestView> {
-    let mut inner = state.lock();
-    update_manifest(&mut inner, |m, _| m.apply(settings))?;
-    // TODO(M8): watch::restart (include/exclude affect the watcher's filter)
-    Ok(manifest_view(&inner))
+    update_manifest(&mut state.lock(), |m, _| m.apply(settings))?;
+    // include/exclude feed the watcher's filter.
+    watch::restart(&app);
+    Ok(manifest_view(&state.lock()))
 }
 
 /// Shows a native folder picker. Runs on a blocking thread with no lock held.
@@ -184,7 +188,7 @@ pub async fn add_folder(
             inner.add_session_root(path.clone());
         }
     }
-    // TODO(M8): watch::restart
+    watch::restart(&app);
     Ok(Some(path))
 }
 
@@ -209,7 +213,11 @@ pub async fn save_folder(state: State<'_, AppState>, path: PathBuf) -> Result<()
 
 /// Removes a saved folder (saving the manifest), a session folder, or the library.
 #[tauri::command]
-pub async fn remove_folder(state: State<'_, AppState>, path: PathBuf) -> Result<()> {
+pub async fn remove_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: PathBuf,
+) -> Result<()> {
     {
         let mut inner = state.lock();
         let home = inner.home.clone();
@@ -234,7 +242,7 @@ pub async fn remove_folder(state: State<'_, AppState>, path: PathBuf) -> Result<
                 .retain(|r| !manifest::same_path(r, &path));
         }
     }
-    // TODO(M8): watch::restart
+    watch::restart(&app);
     Ok(())
 }
 
@@ -251,7 +259,7 @@ pub async fn set_library(
         let mut inner = state.lock();
         update_manifest(&mut inner, |m, home| m.set_library(&path, home))?;
     }
-    // TODO(M8): watch::restart
+    watch::restart(&app);
     Ok(Some(path))
 }
 
@@ -492,11 +500,295 @@ pub async fn start_drag(
     .map_err(|e| Error::Native(e.to_string()))
 }
 
+// ---------------------------------------------------------------------------------------------
+// GitHub: sign-in to the EnvDeck GitHub App with the Device Flow (github_auth.rs); pushes run
+// `gh` with that token (github.rs). The token never leaves Rust.
+
+/// The folder holding a dotenv file, after the scope check.
+fn dotenv_dir(state: &AppState, path: &Path) -> Result<(PathBuf, PathBuf, u64)> {
+    let (path, max) = readable(state, path)?;
+    if !envfile::is_dotenv_name(&name_of(&path)?) {
+        return Err(Error::NotDotenv(path));
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::NotFound(path.clone()))?
+        .to_path_buf();
+    Ok((path, dir, max))
+}
+
+/// Resolves a remote name against the repository next to the file, so the webview can't point
+/// `gh` at an arbitrary repository.
+fn github_remote(dir: &Path, max: u64, remote: &str) -> Result<github::Remote> {
+    github::detect_repo(dir, max)?
+        .remotes
+        .into_iter()
+        .find(|r| r.remote == remote)
+        .ok_or_else(|| Error::NoRepo(format!("No GitHub remote named {remote}")))
+}
+
+const SIGN_IN: &str = "Sign in to GitHub to continue.";
+const EXPIRED: &str = "Your GitHub sign-in expired. Sign in again.";
+
+/// The session's token for a github.com remote (the GitHub App lives on github.com). An expired
+/// token is refreshed first (8-hour tokens; the refresh happens outside the lock).
+async fn github_token(state: &AppState, repo: &github::Remote) -> Result<Token> {
+    if repo.host != "github.com" {
+        return Err(Error::Gh(format!(
+            "Sign-in with GitHub covers github.com repositories; this remote is on {}",
+            repo.host
+        )));
+    }
+    let (token_state, generation) = {
+        let mut inner = state.lock();
+        let session = &mut inner.github;
+        match session.token_state(Instant::now()) {
+            TokenState::SignedOut if session.token.is_some() => {
+                session.sign_out();
+                return Err(Error::GhAuth(EXPIRED.into()));
+            }
+            s => (s, session.generation),
+        }
+    };
+    match token_state {
+        TokenState::Valid(token) => Ok(token),
+        TokenState::SignedOut => Err(Error::GhAuth(SIGN_IN.into())),
+        TokenState::NeedsRefresh(refresh) => {
+            let client_id = github_auth::client_id()?;
+            let poll = tauri::async_runtime::spawn_blocking(move || {
+                github_auth::refresh(client_id, &refresh)
+            })
+            .await
+            .map_err(|e| Error::Native(e.to_string()))?;
+            apply_refresh(state, generation, poll, Instant::now())
+        }
+    }
+}
+
+/// Stores a refreshed grant, unless the user signed out meanwhile. A refused refresh signs out;
+/// a network error keeps the session so the next attempt can retry.
+fn apply_refresh(
+    state: &AppState,
+    generation: u64,
+    poll: Result<Poll>,
+    now: Instant,
+) -> Result<Token> {
+    let mut inner = state.lock();
+    if inner.github.generation != generation {
+        return Err(Error::GhAuth(SIGN_IN.into()));
+    }
+    match poll? {
+        Poll::Done(grant) => {
+            let token = grant.access.clone();
+            inner.github.store(grant, now);
+            Ok(token)
+        }
+        _ => {
+            inner.github.sign_out();
+            Err(Error::GhAuth(EXPIRED.into()))
+        }
+    }
+}
+
+/// Forgets a token GitHub rejected, so the UI offers "Sign in" again.
+fn forget_rejected<T>(state: &AppState, token: &Token, result: Result<T>) -> Result<T> {
+    if let Err(Error::GhAuth(_)) = &result {
+        let mut inner = state.lock();
+        if inner.github.token.as_ref() == Some(token) {
+            inner.github.sign_out();
+        }
+    }
+    result
+}
+
+/// GitHub remotes of the repository whose `.git` sits next to the dotenv file. Reads files only.
+#[tauri::command]
+pub async fn github_repo(state: State<'_, AppState>, path: PathBuf) -> Result<github::RepoInfo> {
+    let (_, dir, max) = dotenv_dir(&state, &path)?;
+    github::detect_repo(&dir, max)
+}
+
+/// Environments and the names of existing secrets/variables (never values).
+#[tauri::command]
+pub async fn github_inspect(
+    state: State<'_, AppState>,
+    path: PathBuf,
+    remote: String,
+) -> Result<github::GithubState> {
+    let (_, dir, max) = dotenv_dir(&state, &path)?;
+    let repo = github_remote(&dir, max, &remote)?;
+    let token = github_token(&state, &repo).await?;
+    let t = token.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        github::inspect(&github::GhCli::locate(t)?, &repo)
+    })
+    .await
+    .map_err(|e| Error::Native(e.to_string()))?;
+    forget_rejected(&state, &token, result)
+}
+
+/// Sets secrets/variables from the file's current values, which Rust reads itself: values never
+/// cross IPC, and only keys that are in the file can be pushed.
+#[tauri::command]
+pub async fn github_push(
+    state: State<'_, AppState>,
+    path: PathBuf,
+    remote: String,
+    items: Vec<github::PushItem>,
+) -> Result<Vec<github::PushResult>> {
+    let (path, dir, max) = dotenv_dir(&state, &path)?;
+    let repo = github_remote(&dir, max, &remote)?;
+    let token = github_token(&state, &repo).await?;
+    let vars = envfile::parse(&fsops::read_text(&path, max)?.text).vars();
+    let t = token.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        github::push(&github::GhCli::locate(t)?, &repo, &vars, &items)
+    })
+    .await
+    .map_err(|e| Error::Native(e.to_string()))?;
+    forget_rejected(&state, &token, result)
+}
+
+/// A GitHub page for the repository next to the file, built in Rust: `install` (the EnvDeck
+/// GitHub App's install page) or `environments` (the repository's environment settings).
+fn github_page_url(repo: &github::Remote, page: &str) -> Result<String> {
+    match page {
+        "install" => Ok(github_auth::install_url(github_auth::app_slug()?)),
+        "environments" => Ok(format!(
+            "https://{}/{}/{}/settings/environments",
+            repo.host, repo.owner, repo.name
+        )),
+        _ => Err(Error::Native(format!("Unknown GitHub page \"{page}\""))),
+    }
+}
+
+/// Opens a GitHub page in the browser. The URL is built in Rust from the detected remote; the
+/// webview only names the page.
+#[tauri::command]
+pub async fn github_open_page(
+    state: State<'_, AppState>,
+    path: PathBuf,
+    remote: String,
+    page: String,
+) -> Result<()> {
+    let (_, dir, max) = dotenv_dir(&state, &path)?;
+    let repo = github_remote(&dir, max, &remote)?;
+    tauri_plugin_opener::open_url(github_page_url(&repo, &page)?, None::<&str>)
+        .map_err(|e| Error::Native(e.to_string()))
+}
+
+/// Whether sign-in is available in this build, and who is signed in.
+#[tauri::command]
+pub async fn github_account(state: State<'_, AppState>) -> Result<github_auth::Account> {
+    Ok(github_auth::account(&state.lock().github))
+}
+
+fn open_verification() -> Result<()> {
+    tauri_plugin_opener::open_url(github_auth::VERIFY_URL, None::<&str>)
+        .map_err(|e| Error::Native(e.to_string()))
+}
+
+/// Starts the Device Flow: returns the code to type and opens github.com/login/device.
+#[tauri::command]
+pub async fn github_sign_in_start(state: State<'_, AppState>) -> Result<github_auth::DeviceLogin> {
+    let client_id = github_auth::client_id()?;
+    let (login, device_code, interval) =
+        tauri::async_runtime::spawn_blocking(move || github_auth::request_device_code(client_id))
+            .await
+            .map_err(|e| Error::Native(e.to_string()))??;
+    {
+        let mut inner = state.lock();
+        let session = &mut inner.github;
+        session.generation += 1;
+        session.flow = Some(github_auth::Flow {
+            device_code,
+            interval_secs: interval,
+            expires_in_secs: login.expires_in,
+            generation: session.generation,
+        });
+    }
+    // The dialog shows the code and a button to open the page again if this fails.
+    let _ = open_verification();
+    Ok(login)
+}
+
+/// Opens github.com/login/device again (a fixed URL; nothing from the webview).
+#[tauri::command]
+pub async fn github_open_verification() -> Result<()> {
+    open_verification()
+}
+
+/// Waits until the user approves the code on GitHub, it expires, or sign-in is cancelled.
+#[tauri::command]
+pub async fn github_sign_in_wait(app: AppHandle) -> Result<github_auth::Account> {
+    tauri::async_runtime::spawn_blocking(move || wait_for_sign_in(&app.state::<AppState>()))
+        .await
+        .map_err(|e| Error::Native(e.to_string()))?
+}
+
+fn wait_for_sign_in(state: &AppState) -> Result<github_auth::Account> {
+    let client_id = github_auth::client_id()?;
+    let flow = state
+        .lock()
+        .github
+        .flow
+        .clone()
+        .ok_or_else(|| Error::GhAuth("No sign-in in progress.".into()))?;
+    let current = || state.lock().github.generation == flow.generation;
+    let fail = |msg: &str| {
+        let mut inner = state.lock();
+        if inner.github.generation == flow.generation {
+            inner.github.flow = None;
+        }
+        Error::GhAuth(msg.into())
+    };
+    let deadline = Instant::now() + Duration::from_secs(flow.expires_in_secs);
+    let mut interval = flow.interval_secs.max(1);
+    loop {
+        // Sleep in short steps so Cancel (sign-out) takes effect quickly.
+        let wake = Instant::now() + Duration::from_secs(interval);
+        while Instant::now() < wake {
+            if !current() {
+                return Err(Error::GhAuth("Sign-in cancelled.".into()));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if Instant::now() >= deadline {
+            return Err(fail("The sign-in code expired. Start again."));
+        }
+        match github_auth::poll_token(client_id, &flow.device_code, interval)? {
+            Poll::Pending => {}
+            Poll::SlowDown(next) => interval = next,
+            Poll::Failed(msg) => return Err(fail(&msg)),
+            Poll::Done(grant) => {
+                let login = github_auth::fetch_login(&grant.access)?;
+                let mut inner = state.lock();
+                if inner.github.generation != flow.generation {
+                    return Err(Error::GhAuth("Sign-in cancelled.".into()));
+                }
+                inner.github.store(grant, Instant::now());
+                inner.github.login = Some(login);
+                inner.github.flow = None;
+                return Ok(github_auth::account(&inner.github));
+            }
+        }
+    }
+}
+
+/// Forgets the token (memory only) and cancels a sign-in in progress.
+#[tauri::command]
+pub async fn github_sign_out(state: State<'_, AppState>) -> Result<github_auth::Account> {
+    let mut inner = state.lock();
+    inner.github.sign_out();
+    Ok(github_auth::account(&inner.github))
+}
+
 /// Registers state and loads the manifest. Called from `lib.rs` setup.
 pub fn init_state(app: &AppHandle) {
     let mut inner = Inner::default();
     load_state(&mut inner);
     app.manage(AppState::new(inner));
+    watch::restart(app);
 }
 
 #[cfg(test)]
@@ -548,6 +840,168 @@ mod tests {
             "{ broken"
         );
         assert_eq!(inner.manifest.max_depth, None);
+    }
+
+    #[test]
+    fn github_commands_check_scope_and_resolve_remotes_in_rust() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("code");
+        let outside = dir.path().join("elsewhere");
+        for d in [&root, &outside] {
+            std::fs::create_dir_all(d.join(".git")).unwrap();
+            std::fs::write(
+                d.join(".git/config"),
+                "[remote \"origin\"]\n\turl = git@github.com:acme/shop.git\n",
+            )
+            .unwrap();
+            std::fs::write(d.join(".env"), "A=1\n").unwrap();
+            std::fs::write(d.join("app.json"), "{}").unwrap();
+        }
+        let mut inner = inner_with(dir.path(), None);
+        inner.add_session_root(dunce::canonicalize(&root).unwrap());
+        let state = AppState::new(inner);
+
+        let (_, repo_dir, max) = dotenv_dir(&state, &root.join(".env")).unwrap();
+        assert_eq!(
+            github_remote(&repo_dir, max, "origin").unwrap().owner,
+            "acme"
+        );
+        assert!(matches!(
+            github_remote(&repo_dir, max, "evil"),
+            Err(Error::NoRepo(_))
+        ));
+        assert!(matches!(
+            dotenv_dir(&state, &outside.join(".env")),
+            Err(Error::OutOfScope(_))
+        ));
+        assert!(matches!(
+            dotenv_dir(&state, &root.join("../elsewhere/.env")),
+            Err(Error::OutOfScope(_))
+        ));
+        assert!(matches!(
+            dotenv_dir(&state, &root.join("app.json")),
+            Err(Error::NotDotenv(_))
+        ));
+    }
+
+    fn shop_remote() -> github::Remote {
+        github::Remote {
+            remote: "origin".into(),
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "shop".into(),
+        }
+    }
+
+    fn grant(access: &str, expires_in: u64) -> github_auth::Grant {
+        github_auth::Grant {
+            access: Token::new(access),
+            expires_in: Some(expires_in),
+            refresh: Some(Token::new("ghr_refresh")),
+            refresh_expires_in: Some(15_897_600),
+        }
+    }
+
+    #[test]
+    fn github_token_needs_sign_in_and_rejected_tokens_are_forgotten() {
+        let token_for = |state: &AppState, repo: &github::Remote| {
+            tauri::async_runtime::block_on(github_token(state, repo))
+        };
+        let state = AppState::default();
+        let mut repo = shop_remote();
+        assert!(matches!(token_for(&state, &repo), Err(Error::GhAuth(_))));
+
+        let token = Token::new("ghu_test");
+        state
+            .lock()
+            .github
+            .store(grant("ghu_test", 28_800), Instant::now());
+        state.lock().github.login = Some("octocat".into());
+        assert_eq!(token_for(&state, &repo).unwrap(), token);
+
+        repo.host = "ghe.example.com".into();
+        assert!(matches!(token_for(&state, &repo), Err(Error::Gh(_))));
+
+        let ok: Result<()> = forget_rejected(&state, &token, Err(Error::Gh("HTTP 403".into())));
+        assert!(ok.is_err() && state.lock().github.token.is_some());
+        let _ = forget_rejected::<()>(&state, &token, Err(Error::GhAuth("rejected".into())));
+        assert!(state.lock().github.token.is_none());
+        assert!(state.lock().github.login.is_none());
+    }
+
+    #[test]
+    fn expired_tokens_without_a_refresh_sign_out() {
+        let state = AppState::default();
+        let t0 = Instant::now();
+        state.lock().github.store(
+            github_auth::Grant {
+                refresh: None,
+                refresh_expires_in: None,
+                ..grant("ghu_old", 1)
+            },
+            t0,
+        );
+        state.lock().github.login = Some("octocat".into());
+        let err = tauri::async_runtime::block_on(github_token(&state, &shop_remote())).unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err}");
+        assert!(state.lock().github.login.is_none());
+    }
+
+    #[test]
+    fn refreshes_are_stored_unless_signed_out_meanwhile() {
+        let state = AppState::default();
+        let now = Instant::now();
+        let generation = state.lock().github.generation;
+
+        let token = apply_refresh(
+            &state,
+            generation,
+            Ok(Poll::Done(grant("ghu_new", 28_800))),
+            now,
+        )
+        .unwrap();
+        assert_eq!(token, Token::new("ghu_new"));
+        assert_eq!(
+            state.lock().github.token_state(now),
+            TokenState::Valid(Token::new("ghu_new"))
+        );
+
+        // A network error keeps the session for a later retry.
+        let err = apply_refresh(&state, generation, Err(Error::Gh("offline".into())), now);
+        assert!(matches!(err, Err(Error::Gh(_))));
+        assert!(state.lock().github.token.is_some());
+
+        // GitHub refused the refresh: signed out.
+        let err = apply_refresh(&state, generation, Ok(Poll::Failed("bad".into())), now);
+        assert!(matches!(err, Err(Error::GhAuth(_))));
+        assert!(state.lock().github.token.is_none());
+
+        // Signed out (generation bumped) while refreshing: the new grant is dropped.
+        let stale = generation + 1;
+        state.lock().github.sign_out();
+        let err = apply_refresh(
+            &state,
+            stale - 1,
+            Ok(Poll::Done(grant("ghu_late", 60))),
+            now,
+        );
+        assert!(matches!(err, Err(Error::GhAuth(_))));
+        assert!(state.lock().github.token.is_none());
+    }
+
+    #[test]
+    fn github_pages_are_built_in_rust() {
+        let repo = shop_remote();
+        assert_eq!(
+            github_page_url(&repo, "environments").unwrap(),
+            "https://github.com/acme/shop/settings/environments"
+        );
+        assert!(github_page_url(&repo, "https://evil.example").is_err());
+        // The install page needs the compiled-in slug.
+        assert_eq!(
+            github_page_url(&repo, "install").is_ok(),
+            github_auth::app_slug().is_ok()
+        );
     }
 
     #[test]

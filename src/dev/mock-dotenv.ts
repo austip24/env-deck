@@ -85,6 +85,11 @@ export function parseEnv(text: string): ParsedEnv {
     const q = vp[0];
     const quote: Quote = q === "'" ? "single" : q === '"' ? "double" : q === "`" ? "backtick" : "none";
     if (quote === "none") {
+      // `KEY= # note`: whitespace then `#` is a comment, not the value.
+      if (vp.startsWith("#") && vp.length < afterKey.length - 1) {
+        lines.push({ type: "pair", key: km, value: "", quote, export: exp, startLine: n, endLine: n, inlineComment: vp.trim() });
+        continue;
+      }
       const hash = vp.search(/[ \t]#/);
       const value = (hash >= 0 ? vp.slice(0, hash) : vp).trimEnd();
       const inlineComment = hash >= 0 ? vp.slice(hash).trim() : null;

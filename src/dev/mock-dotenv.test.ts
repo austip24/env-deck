@@ -16,6 +16,7 @@ describe("mock dotenv parser", () => {
     expect(b.value).toBe("$HOME x");
     expect(c.value).toBe('l1\nl2 "q"');
     expect(d.value).toBe("#fff");
+    expect(pairs("DSN= # later")[0]).toMatchObject({ value: "", inlineComment: "# later" });
     expect(e.value).toBe("it's");
   });
 

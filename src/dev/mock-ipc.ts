@@ -4,6 +4,7 @@
 //
 // The dotenv parsing lives in mock-dotenv.ts, a small mock-only port of envfile.rs.
 
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   ConfigContent,
@@ -11,6 +12,11 @@ import type {
   CopyOutcome,
   EnvVar,
   FolderView,
+  GithubAccount,
+  GithubPushItem,
+  GithubPushResult,
+  GithubRemote,
+  GithubState,
   ManifestView,
   OnConflict,
   RootStatus,
@@ -27,6 +33,7 @@ import {
   templateTarget,
   upsert,
 } from "@/dev/mock-dotenv";
+import { effectiveVars } from "@/lib/env";
 
 // Sentinel checked by scripts/check-bundle.mjs; do not remove.
 export const MOCK_SENTINEL = "__ENVDECK_MOCK_IPC__";
@@ -111,7 +118,14 @@ function seed() {
 
   const blog = `${HOME}/code/blog`;
   put(`${blog}/package.json`, "{}\n");
+  // A GitHub remote beside .env.local, for "Push to GitHub".
+  put(
+    `${blog}/.git/config`,
+    '[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/blog.git\n[remote "fork"]\n\turl = https://github.com/dev/blog\n',
+  );
   put(`${blog}/.env.local`, "CMS_TOKEN=fake-token-123\nPREVIEW=true\n");
+  // A template whose target (.env.production) doesn't exist yet.
+  put(`${blog}/.env.production.example`, "CMS_TOKEN=\nPREVIEW=false\nANALYTICS_ID=\n");
   put(`${blog}/.npmrc`, "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\nsave-exact=true\n");
   put(`${blog}/node_modules/some-pkg/.env`, "IGNORED=yes\n");
 
@@ -355,6 +369,86 @@ function copyConfig(src: string, destDir: string, onConflict: OnConflict = "fail
   }
 }
 
+// --- GitHub (mirrors github.rs; nothing leaves the browser) -----------------------------------
+
+const REMOTE_RE = /\[remote "([^"]+)"\]\s*\n\s*url = (?:git@|https:\/\/)([^:/\s]+)[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/gm;
+
+function githubRemotes(path: string): GithubRemote[] {
+  ensureWithin(path);
+  if (!isDotenvName(basename(path))) throw `${path} isn't a dotenv file`;
+  const config = files.get(join(dirname(path), ".git/config"));
+  if (!config) throw `NO_REPO: ${dirname(path)} has no .git folder`;
+  const remotes: GithubRemote[] = [...config.text.matchAll(REMOTE_RE)].map((m) => ({
+    remote: m[1],
+    host: m[2],
+    owner: m[3],
+    name: m[4],
+  }));
+  if (remotes.length === 0) throw "NO_REPO: The repository next to this file has no GitHub remote";
+  return remotes.sort((a, b) => Number(b.remote === "origin") - Number(a.remote === "origin"));
+}
+
+function githubRemote(path: string, remote: string): GithubRemote {
+  const r = githubRemotes(path).find((x) => x.remote === remote);
+  if (!r) throw `NO_REPO: No GitHub remote named ${remote}`;
+  return r;
+}
+
+const github: GithubState = {
+  repo: "",
+  environments: ["production", "staging"],
+  repoNames: { secrets: ["CMS_TOKEN"], variables: [] },
+  envNames: { production: { secrets: [], variables: ["PREVIEW"] }, staging: { secrets: [], variables: [] } },
+  warnings: [],
+};
+
+/** Mock sign-in (github_auth.rs): in memory, like the real token. */
+const githubAuth = {
+  login: null as string | null,
+  pending: null as number | null,
+  generation: 0,
+  approveAfterMs: 2000,
+};
+
+const githubAccount = (): GithubAccount => ({ configured: true, login: githubAuth.login });
+
+function requireSignIn() {
+  if (!githubAuth.login) throw "GH_AUTH: Sign in to GitHub to continue.";
+}
+
+/** The mock EnvDeck GitHub App is installed on `acme/*` only, so the `fork` remote shows the install prompt. */
+function requireInstalled(r: GithubRemote) {
+  if (r.owner !== "acme") {
+    throw `GH_NOT_INSTALLED: EnvDeck isn't installed on ${r.owner}/${r.name}. Install the EnvDeck GitHub App on it (or ask an owner to), then try again.`;
+  }
+}
+
+function githubPush(path: string, remote: string, items: GithubPushItem[]): GithubPushResult[] {
+  const r = githubRemote(path, remote);
+  requireInstalled(r);
+  const vars = new Map(effectiveVars(parseEnv(getFile(path).text)).map((v) => [v.key, v.value]));
+  return items.map((item) => {
+    const value = vars.get(item.key);
+    let error: string | null = null;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(item.key) || /^GITHUB_/i.test(item.key)) {
+      error = `"${item.key}" isn't a valid GitHub name`;
+    } else if (value === undefined) error = `${item.key} isn't in the file any more`;
+    else if (value === "") error = "GitHub doesn't accept empty values";
+    else if (item.key === "FAIL_ME") error = "HTTP 403: Resource not accessible by integration";
+    else if (item.environment !== null && !github.environments.includes(item.environment)) {
+      error = `The ${item.environment} environment doesn't exist on GitHub. Create it in the repository's settings first.`;
+    } else {
+      const names = item.environment === null ? github.repoNames : github.envNames[item.environment];
+      const list = item.kind === "secret" ? names.secrets : names.variables;
+      if (!list.includes(item.key)) list.push(item.key);
+    }
+    // Key names only; never values.
+    const env = item.environment ? ` --env ${item.environment}` : "";
+    console.info(`[mock] gh ${item.kind} set ${item.key} --repo ${r.owner}/${r.name}${env}`);
+    return { ...item, error };
+  });
+}
+
 type Args = Record<string, unknown>;
 
 const handlers: Record<string, (a: Args) => unknown> = {
@@ -418,6 +512,49 @@ const handlers: Record<string, (a: Args) => unknown> = {
     console.info("[mock] file clipboard (native only):", a.paths);
   },
   reveal: (a) => console.info("[mock] reveal (native only):", ensureWithin(a.path as string)),
+  github_repo: (a) => ({ remotes: githubRemotes(a.path as string) }),
+  github_inspect: (a) => {
+    const r = githubRemote(a.path as string, a.remote as string);
+    requireSignIn();
+    requireInstalled(r);
+    return structuredClone({ ...github, repo: `${r.owner}/${r.name}` });
+  },
+  github_push: (a) => {
+    requireSignIn();
+    return githubPush(a.path as string, a.remote as string, a.items as GithubPushItem[]);
+  },
+  github_account: () => githubAccount(),
+  github_sign_in_start: () => {
+    githubAuth.generation += 1;
+    githubAuth.pending = githubAuth.generation;
+    console.info("[mock] open https://github.com/login/device (native only)");
+    return { userCode: "WDJB-MJHT", verificationUri: "https://github.com/login/device", expiresIn: 900 };
+  },
+  github_sign_in_wait: async () => {
+    const flow = githubAuth.pending;
+    if (flow === null) throw "GH_AUTH: No sign-in in progress.";
+    // Pretend the user approves the code on GitHub after a moment.
+    await new Promise((r) => setTimeout(r, githubAuth.approveAfterMs));
+    if (githubAuth.generation !== flow) throw "GH_AUTH: Sign-in cancelled.";
+    githubAuth.pending = null;
+    githubAuth.login = "octocat";
+    return githubAccount();
+  },
+  github_open_verification: () => console.info("[mock] open https://github.com/login/device (native only)"),
+  github_open_page: (a) => {
+    const r = githubRemote(a.path as string, a.remote as string);
+    const url =
+      a.page === "install"
+        ? "https://github.com/apps/envdeck/installations/new"
+        : `https://github.com/${r.owner}/${r.name}/settings/environments`;
+    console.info(`[mock] open ${url} (native only)`);
+  },
+  github_sign_out: () => {
+    githubAuth.login = null;
+    githubAuth.pending = null;
+    githubAuth.generation += 1;
+    return githubAccount();
+  },
   start_drag: (a) => console.info("[mock] drag-out (native only):", ensureWithin(a.path as string)),
 
   // Plugin commands the UI calls directly.
@@ -436,5 +573,22 @@ mockIPC(
   },
   { shouldMockEvents: true },
 );
+
+// Simulate an edit by another program (the watcher in watch.rs) from the devtools console:
+//   __envdeckMock.touch("/Users/dev/code/shop/apps/web/.env", "A=1\n")
+(window as unknown as { __envdeckMock: unknown }).__envdeckMock = {
+  /** Tests: how long the mock "user" takes to approve a GitHub sign-in. */
+  githubApproveAfter: (ms: number) => {
+    githubAuth.approveAfterMs = ms;
+  },
+  touch: (path: string, text: string) => {
+    put(path, text);
+    return emit("configs-changed", { paths: [path] });
+  },
+  remove: (path: string) => {
+    files.delete(path);
+    return emit("configs-changed", { paths: [path] });
+  },
+};
 
 console.info(`[${MOCK_SENTINEL}] mock IPC active`);

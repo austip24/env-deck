@@ -16,7 +16,8 @@
         "width": 1200,
         "height": 780,
         "minWidth": 820,
-        "minHeight": 520
+        "minHeight": 520,
+        "incognito": true
       }
     ],
     "security": {
@@ -36,7 +37,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "msi"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "msi"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "Find, compare and copy local .env and config files",
     "icon": [
@@ -45,6 +51,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "publisher": "Austin Pierson",
+    "copyright": "© 2026 Austin Pierson",
+    "longDescription": "EnvDeck finds the .env and config files spread across your projects, shows them with secrets masked, compares them with their templates and copies them where you need them. It keeps no database: the files on disk are the source of truth."
   }
 }

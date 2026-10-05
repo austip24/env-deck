@@ -14,7 +14,11 @@ it in, the details the architecture leaves open, and the checks that close each 
 | M2 | dotenv engine | **done** (2026-10-04) |
 | M3 | Scanner | **done** (2026-10-04) |
 | M4 | IPC surface | **done** (2026-10-04) |
-| M5–M9 | | not started |
+| M5 | Read-only UI | **done** (2026-10-04, uncommitted) |
+| M6 | Getting configs out | **done** (2026-10-04, uncommitted) |
+| M7 | Writes in the UI | **done** (2026-10-04, uncommitted) |
+| M8 | Live updates | **done** (2026-10-04, uncommitted) |
+| M9 | Hardening, packaging, CI | **done** (2026-10-04, uncommitted; macOS not yet run) |
 
 ## Milestones at a glance
 
@@ -317,7 +321,26 @@ snake_case; Tauri exposes them camelCase to JS.
 
 ---
 
-## M5: Read-only UI
+## M5: Read-only UI (done)
+
+Notes from implementation (beyond the spec below):
+- shadcn components came from `npx shadcn add`; the CLI picked pnpm (a `pnpm-lock.yaml` exists),
+  added a bogus `cn` package and imported `cn` from it. Fixed: imports point at `@/lib/utils`,
+  `package.json` reverted, `node_modules` reinstalled with `npm ci`.
+- Secret masking in source view extends to JSON/YAML/TOML/INI files line by line
+  (`env.secretSpanInLine`, e.g. `appsettings.json` connection strings, `.npmrc` `_authToken`);
+  "Reveal secrets" toggles them. ARCHITECTURE.md §Security updated.
+- `isSecretKey` matches whole key words (split on `_ . -` and camelCase), so `KEYBOARD_LAYOUT`,
+  `MONKEY_COUNT` and `AUTHOR` aren't masked; `isSecret` never masks empty values. The mask is a
+  fixed 8 dots.
+- `formatVars` returns `{ text, warnings }` (multi-line values in shell formats, invalid shell
+  names for `export`, `%`/`!`/`"` for cmd). POSIX quoting leaves `=` bare (docker `-e K=v`).
+- Table: overridden duplicates are dimmed with a badge and aren't selectable; invalid lines are
+  shown with their reason; shift-click selects ranges. Source: invalid lines are tinted.
+- `FileView` is keyed by path, so reveal state, tab and selection reset when switching files.
+- ⌘/Ctrl+R `preventDefault`s, which should also stop the webview's reload: confirm natively.
+- Checked in `dev:mock` with headless Edge screenshots, light and dark: sidebar, table, source
+  (masked and revealed), JSON masking, filter, no-folders state. Not yet run in the native app.
 
 shadcn components to add (hand-write if the registry is blocked): `button`, `input`, `badge`,
 `tabs`, `table`, `dialog`, `dropdown-menu`, `context-menu`, `tooltip`, `scroll-area`,
@@ -356,7 +379,24 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 
 ---
 
-## M6: Getting configs out
+## M6: Getting configs out (done)
+
+Notes from implementation (beyond the spec below):
+- Theme switched to shadcn's "blue" color theme on the neutral base (primary, secondary,
+  sidebar-primary and chart tokens from shadcn-ui/ui `apps/v4/registry/themes.ts`).
+- `hooks/use-copy.ts` owns every copy/open/reveal/drag action and its toast; `lib/ipc.ts` gained
+  `writeClipboardText` and `openEditorUrl` so plugin calls also go through the one IPC module.
+- Header: reveal toggle, drag handle (`start_drag` on pointer-down), Copy (primary, ⇧C),
+  Copy as… (selection or all; label says which), Open in editor (E), and a menu with Copy file
+  (⇧F), Copy path, Copy relative path (project-relative, `/`) and Reveal.
+- Right-click menus: table rows (copy value / key / `KEY=value`, reveal) and sidebar files
+  (open, copy file, copy path, relative path, reveal).
+- Fixed: rapid checkbox clicks could drop a selection (now a functional state update); the
+  select-all checkbox shows a dash when partially selected (edited `ui/checkbox.tsx`).
+- The opener URL scope uses `glob::Pattern` with default options, so `vscode://file/*` matches
+  nested paths.
+- Checked in `dev:mock` (headless Edge, light and dark). **Not yet run natively:** text
+  clipboard, editor URLs, file clipboard, drag-out and reveal all need the native smoke test.
 
 - **Copy contents** (⇧C): clipboard-manager `writeText` of the raw file (unmasked; it's an
   explicit action). Toast "Copied".
@@ -371,7 +411,28 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 
 ---
 
-## M7: Writes in the UI
+## M7: Writes in the UI (done)
+
+Notes from implementation (beyond the spec below):
+- **Parser fix:** `KEY= # note` was read as the value `# note`; it's now an empty value with an
+  inline comment (Rust `envfile.rs` and the mock port, each with a test that failed first).
+- Edit mode (`source-editor.tsx`): Edit button in the header; Save (⌘/Ctrl+S) and Discard sit
+  above the textarea so toasts can't cover them. On `STALE` the draft is kept, with
+  "Copy my edits" and "Discard and reload". Variables/Compare tabs are disabled while editing.
+  Switching files with unsaved edits opens a "Discard unsaved changes?" dialog (App).
+- Copy to… (header ⋯ menu): projects + library + Browse (session grant), file-name validation,
+  "this folder" marker, refuses copying a file onto itself, warns when the name is known to exist,
+  and turns an `EXISTS` error into that warning instead of a toast.
+- Send to… (in the Copy as menu): only sends added/changed keys (unchanged ones would be
+  re-quoted for nothing). Templates (usually committed) and EnvDeck backups
+  (`.bak-<secs>`, `.copy`) aren't offered as targets; backups aren't compare candidates either.
+- Compare tab: default target per spec; "Differences only" switch; per-key reveal; "Add N missing
+  keys" uses the other file's values.
+- Template prompt: an `env-template` whose target is missing shows "Create <target>" in the
+  header; the new file opens after creation.
+- New UI primitive: `ui/switch.tsx` (hand-written, new-york style).
+- Checked in `dev:mock` (headless Edge, light and dark): compare + add missing, edit, leave
+  confirmation, stale save, copy-to with an existing file then backup, send-to preview, template.
 
 - **Source edit + save** (S): toggle to a `textarea`, editing shows the raw unmasked text with a
   warning banner; on save normalise `\r\n|\n` to the file's `lineEnding`, call `write_config`
@@ -391,7 +452,30 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 
 ---
 
-## M8: Live updates (`watch.rs`)
+## M8: Live updates (`watch.rs`) (done)
+
+Notes from implementation (beyond the spec below):
+- `watch::start(roots, settings, sink)` is testable without Tauri; `watch::restart(app)` wraps it
+  with `emit("configs-changed", { paths })` and stores the handle in `Inner.watcher` (old watchers
+  are dropped first). Called from setup, `reload_manifest`, `save_manifest`, `add_folder`,
+  `remove_folder` and `set_library`. Missing roots are skipped.
+- Payload `{ paths: string[] }`; an empty list means "rescan everything" (watcher overflow /
+  `need_rescan`, or a watcher error). Remove/rename events pass even for non-config paths (a folder
+  may take configs with it); excluded dirs, `*.envdeck-tmp` and the root itself never do.
+- Tests: the filter, plus a real watcher on a temp folder (config change reported, `node_modules`
+  and `main.rs` changes not); passed repeatedly on Windows.
+- UI (`use-workspace`): batches within 250 ms collapse into one rescan; the open file reloads if
+  its path is in the batch (or on "rescan everything").
+- Editor: the draft keeps the mtime it was based on, so a reload underneath it can't turn a save
+  into a silent overwrite. No edits → the draft follows the new file; edits → the "changed on
+  disk" banner appears immediately. With unsaved edits the file stays open even if it's deleted
+  or unreadable (`setHoldSelection`), so the draft can still be copied.
+- Compare refetches the other file on every rescan, so its changes show up too.
+- `dev:mock`: `__envdeckMock.touch(path, text)` / `.remove(path)` simulate external changes.
+  Tauri's event mock never removes listeners (its unlisten handler reads `args.id`, the API sends
+  `eventId`), so StrictMode's first listener logs "Couldn't find callback id": mock-only noise.
+- Not done: skipping truncated roots (plan's risk note). Revisit if watching a huge root is slow.
+- Not yet run natively: the `emit` path and macOS FSEvents.
 
 - `restart(app, roots, library, cfg) -> WatchHandle`: one `notify-debouncer-full` debouncer per
   existing root, 400 ms, `RecursiveMode::Recursive`. Drop the old handles first.
@@ -406,7 +490,36 @@ shadcn components to add (hand-write if the registry is blocked): `button`, `inp
 
 ---
 
-## M9: Hardening, packaging, CI
+## M9: Hardening, packaging, CI (done)
+
+Notes from implementation:
+- **Audits:** no logging of contents (only two `eprintln!` in tests, counts only), no
+  `console.*` outside `src/dev`, no storage APIs, no network code.
+- **Capabilities** cut to `core:event:allow-listen`/`allow-unlisten`, clipboard text write and the
+  editor-URL opener scope (`core:default` dropped).
+- **Watcher memory fix:** `RecommendedCache` walked and cached every file under each root
+  (including `node_modules`): ~990 MB for a real `C:\dev\NextJSApps` root. Switched to `NoCache`:
+  ~36 MB for the same roots.
+- **Private webview:** `incognito: true` on the window, so WebView2/WKWebView keep no HTTP cache,
+  cookies or web storage. The runtime folder (`EBWebView`) still exists; documented in
+  ARCHITECTURE.md §1.
+- **Icon:** `src-tauri/icons/source/envdeck.svg` (a deck of KEY=value cards on the theme blue);
+  bundle icons regenerated with `tauri icon` (mobile sets removed).
+- **Bundles:** publisher, copyright, long description. `npm run tauri build` on Windows produced
+  `EnvDeck_0.1.0_x64-setup.exe` (2.1 MB) and `EnvDeck_0.1.0_x64_en-US.msi` (3.0 MB); the release exe
+  loads under the production CSP (`http://tauri.localhost`) and blocks `fetch`.
+- **Automated native smoke test** (`npm run smoke:native`, Windows): sandboxed `ENVDECK_CONFIG`,
+  drives WebView2 over CDP, 26 checks (scope guard for every path-taking command, stale save,
+  CRLF upsert, copy policies, template, `save_manifest` scope, fs/window/opener permissions, CSP,
+  watcher, Ctrl+R). All pass.
+- **Manual checklist:** `docs/SMOKE_TEST.md` (drag-out, file clipboard, reveal, editor links,
+  dialogs, installers, both OSes).
+- **CI:** `.github/workflows/ci.yml` (Windows + macOS: lint, Vitest, build, fmt, clippy, cargo
+  test) and `release.yml` (tags `v*` → tauri-action, Windows + universal macOS, draft release;
+  Apple signing secrets commented until available).
+- **README** rewritten for users and contributors, with release and signing steps.
+- **Open:** macOS build/run not done (no Mac here); `pnpm-lock.yaml` is still in the repo (CI
+  uses `npm ci`).
 
 - **Capability audit:** final `default.json` matches ARCHITECTURE.md §Security; no `fs`;
   opener URL scope only editor `://file/*`. Confirm the CSP blocks a test `fetch("https://…")`.

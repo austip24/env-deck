@@ -163,7 +163,6 @@ impl Matcher {
     }
 
     /// True if any component of `rel` (a path relative to a root) is an excluded directory.
-    #[allow(dead_code)] // TODO(M8): used by the watcher
     pub fn in_excluded_dir(&self, rel: &Path) -> bool {
         let mut components = rel.components().peekable();
         while let Some(c) = components.next() {

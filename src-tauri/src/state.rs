@@ -1,6 +1,7 @@
 //! In-memory session state and the scope guard.
 //!
-//! Nothing here is persisted: session folders and destination grants are forgotten on quit.
+//! Nothing here is persisted: session folders, destination grants and the GitHub sign-in are
+//! forgotten on quit.
 //! Commands copy what they need out of the lock (`read_scopes`, `write_scopes`, ...) and never
 //! hold it across `.await` or a blocking dialog.
 
@@ -37,6 +38,10 @@ pub struct Inner {
     pub session_roots: Vec<PathBuf>,
     /// Folders picked in a native destination dialog this session; writable, not readable.
     pub dest_grants: Vec<PathBuf>,
+    /// File watchers for the current roots; replaced by `watch::restart`.
+    pub watcher: Option<crate::watch::WatchHandle>,
+    /// GitHub sign-in for this session (token in memory only; redacted in `Debug`).
+    pub github: crate::github_auth::Session,
 }
 
 /// A root to scan, as the scanner needs it.

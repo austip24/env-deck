@@ -284,7 +284,24 @@ fn parse_entry(raw: &[RawLine], i: usize) -> (Line, usize) {
     let Some(value_part) = after_key.strip_prefix('=') else {
         return other("missing '=' after the key");
     };
+    let after_eq = value_part;
     let value_part = value_part.trim_start_matches(is_blank_char);
+
+    // `KEY= # note`: whitespace then `#` is a comment, not the value.
+    if value_part.starts_with('#') && value_part.len() < after_eq.len() {
+        return (
+            Line::Pair(Pair {
+                key: key.to_string(),
+                value: String::new(),
+                quote: Quote::None,
+                export,
+                start_line: n,
+                end_line: n,
+                inline_comment: Some(value_part.trim_end().to_string()),
+            }),
+            1,
+        );
+    }
 
     let quote = match value_part.chars().next() {
         Some('\'') => Quote::Single,
@@ -569,6 +586,11 @@ mod tests {
         let p = pair("KEY=value # note");
         assert_eq!(p.value, "value");
         assert_eq!(p.inline_comment.as_deref(), Some("# note"));
+        // A comment straight after `= ` leaves the value empty (dotenv, Node, Compose agree).
+        let p = pair("SENTRY_DSN= # added later");
+        assert_eq!(p.value, "");
+        assert_eq!(p.inline_comment.as_deref(), Some("# added later"));
+        assert_eq!(pair("A=\t#c").value, "");
         // '#' without preceding whitespace is part of the value.
         assert_eq!(pair("COLOR=#fff").value, "#fff");
         assert_eq!(pair("URL=http://x/#frag").value, "http://x/#frag");

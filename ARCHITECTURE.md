@@ -22,9 +22,10 @@ EnvDeck owns no data. The file system is the only source of truth.
 What this means in practice:
 
 - No app-data directory, no SQLite, no `localStorage`, no Tauri store plugin, no keychain. The webview never persists anything.
-- The app writes `~/.envdeck.json` only when the user explicitly adds/removes a saved folder or picks a library folder. It's pretty-printed, uses `~`-relative paths so it's portable between machines, and can be hand-edited, then picked up with **Folders ▸ … ▸ Reload**.
+- The app writes `~/.envdeck.json` only when the user explicitly adds/removes a saved folder or picks a library folder. It's pretty-printed, uses `~`-relative paths so it's portable between machines, and can be hand-edited, then picked up with **Settings ▸ Reload config file**.
 - "Open folder for this session" scans a folder without writing anything at all.
 - If the user deletes `~/.envdeck.json`, the app just starts empty. Nothing else is left behind.
+- The one exception is outside EnvDeck's control: the system webview keeps a runtime folder (`%LOCALAPPDATA%\com.austi.envdeck\EBWebView` on Windows, WebKit's per-app folder on macOS). The window runs in private mode (`incognito: true`), so no cache, cookies or web storage are written there; it's safe to delete.
 
 Example `~/.envdeck.json`:
 
@@ -53,7 +54,8 @@ Every key is optional and has a built-in default. Keys EnvDeck doesn't recognise
 
 ```
 ┌──────────────────────── Webview (React + shadcn/ui) ────────────────────────┐
-│ Sidebar        project tree, filter (⌘/Ctrl+K), folders, library            │
+│ Sidebar        project tree, filter (⌘/Ctrl+K), folders, library;           │
+│                resizable, hides with ⌘/Ctrl+B (layout is memory-only)       │
 │ FileView       header actions, drag handle, tabs                            │
 │   EnvTable     masked key/value table, multi-select, copy-as, send-to       │
 │   SourceView   raw text, masked for dotenv, edit + save with stale check    │
@@ -92,7 +94,7 @@ One parser shared by viewing, comparing and writing, covering the dialect used b
 
 - `export` prefix, `'single'` (literal), `"double"` (escapes `\n \r \t \" \\`), `` `backtick` `` quotes
 - multi-line quoted values (PEM keys, certs)
-- inline `# comments` after unquoted values
+- inline `# comments` after unquoted values (a `#` needs whitespace before it, so `COLOR=#fff` is a value and `KEY= # note` is empty with a comment)
 - invalid lines are kept as `other` and flagged in the UI instead of silently dropped
 
 `upsert()` changes only the lines for the keys being written (last definition wins, multi-line spans are replaced whole) and appends new keys at the end. Comments, ordering, `export` prefixes and **CRLF line endings** are preserved, which matters on Windows teams. `quote_value()` picks the safest quoting: bare when possible, single quotes for anything with `$` or spaces (no accidental interpolation), double quotes with escapes otherwise. Round-trip tests cover this.
@@ -113,13 +115,24 @@ These files hold secrets, so the webview gets as little power as possible.
 - **Folder pickers run in Rust**, so a compromised page can't fabricate a "user picked this folder" grant.
 - **Native actions that take a path run in Rust.** Reveal-in-folder (`reveal`), drag-out (`start_drag`, using CrabNebula's `drag` crate directly rather than its JS plugin) and the file-object clipboard go through EnvDeck commands, so their paths pass the same scope guard as reads.
 - **The manifest's scope can't be set from the page.** `save_manifest` accepts only non-scope settings (`include`, `excludeDirs`, `maxDepth`, `maxFileBytes`, `editor`). `roots` and `library` change only through the native pickers, `remove_folder`, or the user hand-editing the file and choosing Reload. Otherwise a compromised page could grant itself `~`.
-- **Capabilities** (`capabilities/default.json`) allow only: core defaults (events), clipboard text write, and opening `vscode://`, `vscode-insiders://`, `cursor://` and `windsurf://` file URLs. A strict CSP blocks remote scripts and network access from the page.
-- **Masking.** Values whose key looks secret (`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, `_KEY`, `DSN`, ...) or that are URLs with embedded passwords are masked in the table, source view and compare view until revealed (globally or per value). The reveal state is never persisted. Editing a file in the source view necessarily shows raw values: it's an explicit Edit mode with a warning banner, and values are masked again on leaving it.
-- Nothing is logged, and EnvDeck makes no network calls.
+- **Capabilities** (`capabilities/default.json`) allow only: listening for events (`core:event:allow-listen`/`allow-unlisten`), clipboard text write, and opening `vscode://`, `vscode-insiders://`, `cursor://` and `windsurf://` file URLs. A strict CSP blocks remote scripts and network access from the page.
+- **Masking.** Values whose key looks secret (`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, `_KEY`, `DSN`, ...) or that are URLs with embedded passwords are masked in the table, source view and compare view until revealed (globally or per value). In JSON, YAML, TOML and INI sources (`appsettings.json`, `.npmrc`, ...) the same rules are applied line by line to `"key": "value"`, `key: value` and `key = value` lines, as a best effort. The reveal state is never persisted. Editing a file in the source view necessarily shows raw values: it's an explicit Edit mode with a warning banner, and values are masked again on leaving it.
+- Nothing is logged, and EnvDeck makes no network calls except for the user-initiated **GitHub sign-in and push** (below).
+- **Push to GitHub (`github.rs`).** The repository is the `.git` (directory, or `gitdir:` file for worktrees/submodules) in the same folder as the dotenv file; Rust reads its `config` and keeps remotes with an `owner/repo` URL. The webview only names a remote and keys: Rust re-checks the file against the scope guard, resolves the remote itself (so the page can't target an arbitrary repo) and re-reads the values from disk (so values never cross IPC and only keys in the file can be pushed). Values are written to `gh secret set` / `gh variable set` on **stdin**, never argv (visible in process listings). `gh` does the API calls and sealed-box encryption. It runs with EnvDeck's session token as `GH_TOKEN` (`GITHUB_TOKEN` and the enterprise token variables are cleared, and `gh auth login` isn't needed), with prompts and its update notifier disabled, and with no console window on Windows. A 401 from `gh` clears the session token and the dialog asks the user to sign in again. Only github.com remotes are supported. Existing secrets/variables are listed by name only. No capability or CSP change: everything runs in Rust.
+- **GitHub sign-in (`github_auth.rs`).** Users sign in to the **EnvDeck GitHub App** (not an OAuth App) with the **Device Flow**, the standard for desktop apps, which needs no client secret. Requesting a code from `github.com/login/device/code` takes no scopes. Rust opens the fixed URL `https://github.com/login/device` (the response's URL is never opened) and polls `login/oauth/access_token`, honouring `slow_down`. It then reads `api.github.com/user` for the login name to display. The client ID and slug are compiled in from `ENVDECK_GITHUB_CLIENT_ID` and `ENVDECK_GITHUB_APP_SLUG`, set in the committed `src-tauri/.cargo/config.toml` (an environment variable overrides it); neither is secret, and no client secret or private key is ever shipped. Without them, the dialog says sign-in isn't set up.
+  - **Why a GitHub App:** a user token carries only the app's permissions and only reaches repositories where the user installed the app. It also expires after 8 hours. An OAuth App would need `repo`, which grants every repository, and its token doesn't expire. That matters because the client ID is public and anyone can start a sign-in that shows EnvDeck's name.
+  - **Permissions** are repository permissions only, with no webhook:
+    - Secrets, Variables and Environments: read & write.
+    - Actions: read, for listing environments.
+    - Metadata: read.
+    - **Not** Administration. Creating environments needs it, so EnvDeck can't create them; the dialog's **Manage environments** button opens the repository's environment settings instead.
+  - **Tokens** are the access token, the refresh token and their expiry times. They are kept **in memory only**, in `AppState`, wrapped so `Debug` prints them redacted, and they are never sent to the webview (which only sees `{ configured, login }`) or persisted, per hard rule 1. Five minutes before expiry, `github_token` refreshes them outside the lock. Device Flow tokens refresh without a client secret. A refused refresh signs out; signing out during a refresh discards the result. Users sign in once per app session. Sign-out (or Cancel during sign-in) drops everything and stops a pending poll.
+  - **Install check:** before listing anything, `check_installed` reads `GET /user/installations`, plus `/user/installations/{id}/repositories` for selected-repository installations. If no installation covers the repo, the dialog shows **Install on GitHub**, which opens `github.com/apps/<slug>/installations/new` (built in Rust), and **Try again**.
+  - `ureq` (rustls) is the HTTP client and is used only here.
 
 ### Live updates (`watch.rs`)
 
-One recursive watcher per root (FSEvents on macOS, ReadDirectoryChangesW on Windows), debounced at 400 ms. Events inside excluded dirs are dropped. Events matching an include glob, or any remove/rename that might take configs with it, are emitted to the webview as `configs-changed` with the paths. The UI rescans (debounced) and reloads the open file if it's one of them, so editing `.env` in VS Code shows up in EnvDeck immediately. The watcher is rebuilt whenever roots change.
+One recursive watcher per root (FSEvents on macOS, ReadDirectoryChangesW on Windows), debounced at 400 ms. Events inside excluded dirs are dropped. Events matching an include glob, or any remove/rename that might take configs with it, are emitted to the webview as `configs-changed` with the paths (an empty list means "rescan everything", e.g. after a watcher overflow). The UI rescans (debounced) and reloads the open file if it's one of them, so editing `.env` in VS Code shows up in EnvDeck immediately. If you're editing that file in EnvDeck with unsaved changes, the editor warns straight away and still refuses to save over the newer version. The watcher is rebuilt whenever roots change.
 
 ## 3. Getting configs _out_: copy/paste into VS Code and the file system
 
@@ -132,7 +145,8 @@ This is the core job, so there are several routes, each matching a real habit:
 | **Drag handle**                       | Native drag-out via the `drag` crate, started by the `start_drag` command after the scope check                                                  | Drop the file onto a folder in the VS Code explorer, Finder or Explorer |
 | **Copy to…**                          | Pick a project from the scan, the library, or Browse; rename; choose a conflict policy                                                           | "Give `web/` the same `.env` as `api/`, but back up the old one"        |
 | **Copy selected as…**                 | Selected (or all) variables formatted as `KEY=value`, `export` (bash/zsh), `$env:` (PowerShell), `set` (cmd.exe), JSON, or `docker run -e` flags | Paste into a terminal, CI secret UI, `launch.json` `env` block          |
-| **Send to**                           | Upsert selected variables into another dotenv file, keeping its comments and order                                                               | Promote three keys from `.env` to `.env.local`                          |
+| **Push to GitHub**                    | **GitHub** button in the file header for dotenv files; enabled when `.git` is beside the file (the tooltip says why not), after signing in with GitHub. Per key: secret or variable, and the repository or one of its existing environments (**Manage environments** opens GitHub's settings to add one). Prompts to install the EnvDeck GitHub App on the repo if needed. Shows which names already exist and would be replaced. Runs `gh` from Rust | Seed a repo's Actions secrets and per-environment variables from `.env` |
+| **Send to**                           | Upsert selected variables into another dotenv file, keeping its comments and order. Templates and EnvDeck's backups aren't offered as targets       | Promote three keys from `.env` to `.env.local`                          |
 | **Compare ▸ Add missing keys**        | Upsert keys present in the template/other file but missing here                                                                                  | Catch up after someone adds a key to `.env.example`                     |
 | **Create .env from template**         | `.env.example` → `.env` (refuses to overwrite)                                                                                                   | Fresh clone setup                                                       |
 | **Open in editor** (⌘/Ctrl+E)         | `vscode://file/<path>` via the opener plugin; works without `code` on PATH. `editor` in the manifest switches to Insiders, Cursor or Windsurf.   | Jump to the file                                                        |
@@ -153,6 +167,11 @@ This is the core job, so there are several routes, each matching a real habit:
 | `create_from_template`                                                | `.env.example` → `.env`                                                     |
 | `copy_files_to_clipboard(paths)`                                      | File-object clipboard                                                       |
 | `reveal(path)`, `start_drag(path)`                                    | Reveal in Finder/Explorer; native drag-out                                  |
+| `github_repo(path)`                                                   | GitHub remotes of the `.git` beside a dotenv file (file reads only)         |
+| `github_account`, `github_sign_in_start`, `github_sign_in_wait`, `github_open_verification`, `github_sign_out` | GitHub App sign-in (Device Flow); tokens stay in Rust memory |
+| `github_open_page(path, remote, page)`                                | Open the app's install page or the repo's environment settings (URL built in Rust) |
+| `github_inspect(path, remote)`                                        | Via `gh`: environments plus existing secret/variable names (never values)   |
+| `github_push(path, remote, items)`                                    | Via `gh`: set each key from the file on disk; per-item results              |
 | event `configs-changed`                                               | Watcher push with changed paths                                             |
 
 Command argument and result types are mirrored as TypeScript types in `src/lib/ipc.ts`.

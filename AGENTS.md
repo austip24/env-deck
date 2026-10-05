@@ -9,10 +9,14 @@ doc in the same change or stop and ask.
 ## Stack
 
 - **Shell:** Tauri 2 (Rust, stable toolchain, edition 2024)
-- **Frontend:** React 19, TypeScript (strict), Vite, Tailwind CSS v4, shadcn/ui (new-york, neutral, Radix via the `radix-ui` package), `lucide-react` icons, `sonner` toasts
-- **Rust crates:** `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `drag`, `dunce`, `dirs`, `serde`, `thiserror`
+- **Frontend:** React 19, TypeScript (strict), Vite, Tailwind CSS v4, shadcn/ui (new-york, neutral base with the blue theme, Radix via the `radix-ui` package), `lucide-react` icons, `sonner` toasts
+- **Rust crates:** `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `drag`, `dunce`, `dirs`, `serde`, `thiserror`, `ureq` (GitHub sign-in only)
 - **Tauri plugins:** `dialog`, `opener`, `clipboard-manager`. Drag-out uses CrabNebula's `drag` crate from Rust, not its JS plugin. **Not** `fs`, `store`, `sql` or `stronghold` (`tauri-plugin-dialog` pulls in the `fs` crate internally; it is never registered and has no capability).
 - **Frontend tests:** Vitest
+
+## UI
+
+Shadcn Documentation: https://ui.shadcn.com/llms.txt
 
 ## Commands
 
@@ -24,6 +28,7 @@ npm run build              # tsc + vite build (must pass)
 npm run lint               # oxlint
 npm test                   # vitest (src/**/*.test.ts)
 npm run test:rust          # cargo test (builds the frontend first; Tauri needs ../dist)
+npm run smoke:native       # Windows: automated checks against the real app (docs/SMOKE_TEST.md)
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets   # must be warning-free
 cargo fmt --manifest-path src-tauri/Cargo.toml
 npm run tauri build        # .app/.dmg on macOS, NSIS/MSI on Windows
@@ -42,6 +47,7 @@ src/
   lib/ipc.ts          typed invoke() wrappers: the ONLY place the UI calls Rust
   lib/env.ts          secret detection, masking, compare, clipboard formats
   lib/platform.ts     OS detection, shortcut labels, editor URLs, path display
+  lib/github.ts       Push to GitHub: name rules, default rows, replace status
   dev/mock-ipc.ts     mock IPC for `dev:mock`; must never ship in the app bundle
 scripts/
   check-bundle.mjs    post-build guard: fails if mock IPC is in dist/
@@ -54,6 +60,8 @@ src-tauri/
   src/envfile.rs      comment-preserving dotenv parser and upsert writer
   src/fsops.rs        size-capped reads, atomic writes, copy with conflict policy
   src/watch.rs        debounced recursive watcher -> `configs-changed` event
+  src/github.rs       "Push to GitHub": .git remote detection, runs `gh` with the session token
+  src/github_auth.rs  "Sign in with GitHub": GitHub App Device Flow, token in memory only
 ```
 
 ## Hard rules
@@ -67,7 +75,9 @@ These are product requirements. Do not work around them.
 3. **Every path from the webview passes `state::ensure_within`.** Reads must be inside a scan root or the library. Writes may also target a folder the user picked in a native dialog this session. Folder pickers run in Rust (`pick_folder`), never in the webview, so the page can't fake a grant. A new command that takes a path without this check is a security bug. This includes native actions: reveal and drag-out are EnvDeck commands (`reveal`, `start_drag`), not webview plugin calls. `save_manifest` must never accept `roots` or `library` from the webview.
 4. **Writes are atomic and never silent.** Use `fsops::write_atomic` (temp file + rename). Copy uses an explicit `OnConflict` policy with `fail` as the default. Saving edited text passes the mtime it loaded and is refused if the file changed on disk.
 5. **dotenv edits go through `envfile::upsert`.** Only change the lines for the keys being written. Preserve comments, key order, `export` prefixes and the file's line ending (CRLF must stay CRLF). Use `quote_value` for values; prefer single quotes so `$` isn't interpolated.
-6. **Secrets stay masked by default** in every view that shows values (table, source, compare). Reveal state is in memory only. Never log file contents or values (no `println!`/`console.log` of them). EnvDeck makes no network calls; don't add any (no telemetry, no update checks without an explicit decision).
+6. **Secrets stay masked by default** in every view that shows values (table, source, compare). Reveal state is in memory only. Never log file contents or values (no `println!`/`console.log` of them). EnvDeck makes no network calls except for **Push to GitHub**, and only after the user acts; don't add any others (no telemetry, no update checks without an explicit decision). For that feature:
+   - **Sign-in** (`github_auth.rs`) is the Device Flow for the **EnvDeck GitHub App**, not an OAuth App, using `ureq`, which is only used there. The app's client ID and slug are compiled in from `ENVDECK_GITHUB_CLIENT_ID` and `ENVDECK_GITHUB_APP_SLUG`, set in `src-tauri/.cargo/config.toml`. Never add a client secret or private key. Tokens carry only the app's repository permissions: Secrets, Variables and Environments (read & write), Actions (read) and Metadata (read). They reach only repositories where the app is installed, and they expire after 8 hours. Don't add permissions, and in particular not `Administration`, without an explicit decision. Tokens, including the refresh token, live in Rust memory for the session (`state.github`, redacted in `Debug`). They are refreshed there, never written to disk or the keychain, never sent to the webview, and forgotten on sign-out, on quit, or when GitHub rejects them.
+   - **Pushes** (`github.rs`, the only place that spawns processes) first check that the app is installed on the repo, then run the `gh` CLI with the token as `GH_TOKEN`. Values go to `gh` on stdin, never argv. Rust re-reads the values from disk and resolves the repo from `.git` itself. URLs EnvDeck opens (device login, app install, environment settings) are built in Rust. Nothing `gh` prints is logged.
 7. **Capabilities stay minimal.** Adding a permission to `capabilities/default.json` (or widening the `opener:allow-open-url` scope beyond editor `://file/*` URLs) needs a reason in the PR description.
 8. **Don't honour `.gitignore` when scanning.** `.env` files are usually git-ignored; that's why the app exists. Exclusions come from `excludeDirs`.
 
@@ -78,7 +88,7 @@ These are product requirements. Do not work around them.
 - `~` is expanded with `manifest::expand` and collapsed with `manifest::contract`; use those, not ad-hoc logic.
 - In the UI, use `lib/platform.ts` for shortcut labels (`⌘` vs `Ctrl+`), reveal labels (Finder vs Explorer) and editor URLs (`vscode://file/C:/...` on Windows).
 - Default excludes include `bin`, `obj` and `AppData` (Windows) and `Library` (macOS). Keep them.
-- Features that only work natively (drag-out, file-object clipboard, dialogs, reveal, watcher) can't be checked with `dev:mock`. Say so explicitly when you change them and haven't run the native app.
+- Features that only work natively (drag-out, file-object clipboard, dialogs, reveal, watcher) can't be checked with `dev:mock`. On Windows, `npm run smoke:native` covers the scope guard, writes, watcher, CSP and permissions against the real app; the rest is the manual list in `docs/SMOKE_TEST.md`. Say so explicitly when you change native features and haven't run them.
 
 ## Frontend conventions
 
@@ -88,7 +98,7 @@ These are product requirements. Do not work around them.
 - New IPC calls get a typed wrapper in `lib/ipc.ts` and, where useful, a handler in `dev/mock-ipc.ts` so `dev:mock` keeps working.
 - Errors from commands are strings; show them with `toast.error(errorText(e))`.
 - Text users copy (paths, keys, values, source) must stay selectable (`select-text`/`.selectable`); the rest of the chrome is `select-none` like a native app.
-- Keyboard shortcuts (⌘ on macOS, Ctrl on Windows): K filter, R rescan, ⇧C copy contents, ⇧F copy file, E open in editor, S save while editing. Keep them consistent and don't take over C, V, X, A or Z.
+- Keyboard shortcuts (⌘ on macOS, Ctrl on Windows): K filter, R rescan, B toggle sidebar, ⇧C copy contents, ⇧F copy file, E open in editor, S save while editing. Keep them consistent and don't take over C, V, X, A or Z.
 
 ## Rust conventions
 
@@ -106,4 +116,4 @@ These are product requirements. Do not work around them.
 
 ## Out of scope unless asked
 
-Cloud sync, accounts, secret-manager integrations (Vault, 1Password, Doppler), encryption at rest, auto-update and telemetry. Ideas the team has noted are in ARCHITECTURE.md, "Later ideas".
+Cloud sync, accounts, secret-manager integrations (Vault, 1Password, Doppler; pushing to GitHub Actions secrets/variables, with GitHub sign-in, is the one integration in scope), encryption at rest, auto-update and telemetry. Ideas the team has noted are in ARCHITECTURE.md, "Later ideas".

@@ -11,7 +11,8 @@
     "lint": "oxlint src scripts",
     "test": "vitest run",
     "test:rust": "npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "smoke:native": "node scripts/native-smoke.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
