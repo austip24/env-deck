@@ -12,6 +12,7 @@ import type { GithubState } from "./ipc";
 
 const state: GithubState = {
   repo: "acme/shop",
+  login: "octocat",
   environments: ["production", "staging"],
   repoNames: { secrets: ["API_KEY"], variables: ["LOG_LEVEL"] },
   envNames: {

@@ -17,7 +17,7 @@ function Frame({ icon, title, children }: { icon: ReactNode; title: string; chil
 }
 
 /** No folders yet: explain what EnvDeck does and offer both ways to add one. */
-export function NoFolders({ onAdd }: { onAdd: (persist: boolean) => void }) {
+export function NoFolders({ onAdd, onShowTutorial }: { onAdd: (persist: boolean) => void; onShowTutorial: () => void }) {
   return (
     <Frame icon={<KeyRound />} title="Find your .env and config files">
       <p>
@@ -33,6 +33,9 @@ export function NoFolders({ onAdd }: { onAdd: (persist: boolean) => void }) {
         </Button>
       </div>
       <p className="mt-3 text-xs">Saved folders are listed in ~/.envdeck.json. Session folders aren't saved anywhere.</p>
+      <Button variant="link" size="sm" className="mt-1" onClick={onShowTutorial}>
+        New here? Take the tour
+      </Button>
     </Frame>
   );
 }

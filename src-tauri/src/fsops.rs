@@ -183,6 +183,20 @@ pub fn set_env_vars(path: &Path, vars: &[(String, String)], max: u64) -> Result<
     modified_ms(path)
 }
 
+/// [`set_env_vars`] for an edit made against a loaded copy: refuses with [`Error::Stale`] if the
+/// file's mtime no longer matches the one the caller loaded.
+pub fn set_env_vars_checked(
+    path: &Path,
+    vars: &[(String, String)],
+    max: u64,
+    expected_modified_ms: u64,
+) -> Result<u64> {
+    if modified_ms(path)? != expected_modified_ms {
+        return Err(Error::Stale(path.to_path_buf()));
+    }
+    set_env_vars(path, vars, max)
+}
+
 /// What to do when a copy's destination already exists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -464,6 +478,22 @@ mod tests {
             set_env_vars(&json, &[("A".into(), "1".into())], MAX),
             Err(Error::NotDotenv(_))
         ));
+    }
+
+    #[test]
+    fn set_env_vars_checked_refuses_a_stale_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        write(&p, "A=1 # note\nexport B=2\n");
+        let loaded = modified_ms(&p).unwrap();
+        let edit = |v: &str| vec![("A".to_string(), v.to_string())];
+        assert!(matches!(
+            set_env_vars_checked(&p, &edit("x"), MAX, loaded + 1),
+            Err(Error::Stale(_))
+        ));
+        assert_eq!(read(&p), "A=1 # note\nexport B=2\n", "untouched");
+        set_env_vars_checked(&p, &edit("a $b"), MAX, loaded).unwrap();
+        assert_eq!(read(&p), "A='a $b' # note\nexport B=2\n");
     }
 
     struct CopyFixture {

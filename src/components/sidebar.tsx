@@ -3,6 +3,7 @@ import {
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
+  CircleArrowUp,
   Ellipsis,
   Folder,
   FolderPlus,
@@ -48,6 +49,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { CopyActions } from "@/hooks/use-copy";
+import type { Updates } from "@/hooks/use-update";
 import type { Workspace } from "@/hooks/use-workspace";
 import type { ConfigFile, RootStatus } from "@/lib/ipc";
 import { shortcutLabel } from "@/lib/platform";
@@ -108,6 +110,8 @@ export function Sidebar({
   onCollapsedChange,
   filterRequest,
   onFocusFilter,
+  onShowTutorial,
+  updates,
 }: {
   ws: Workspace;
   copy: CopyActions;
@@ -121,6 +125,8 @@ export function Sidebar({
   /** Bumped by the app (⌘/Ctrl+K) to focus the filter once the full sidebar is showing. */
   filterRequest: number;
   onFocusFilter: () => void;
+  onShowTutorial: () => void;
+  updates: Updates;
 }) {
   const filterRef = useRef<HTMLInputElement>(null);
   const [filter, setFilter] = useState("");
@@ -353,6 +359,12 @@ export function Sidebar({
         <span className="flex-1 truncate">
           {ws.scan ? `${ws.scan.files.length} files · ${ws.scan.elapsedMs} ms` : "Scanning…"}
         </span>
+        {updates.update && (
+          <Button variant="ghost" size="xs" className="text-primary" onClick={() => updates.setDialogOpen(true)}>
+            <CircleArrowUp />
+            Update {updates.update.version}
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="icon-xs" aria-label="Settings">
@@ -379,6 +391,11 @@ export function Sidebar({
                 Remove library…
               </DropdownMenuItem>
             )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={onShowTutorial}>Show tutorial</DropdownMenuItem>
+            <DropdownMenuItem disabled={updates.checking} onSelect={() => void updates.check()}>
+              {updates.checking ? "Checking for updates…" : "Check for updates…"}
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

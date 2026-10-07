@@ -37,8 +37,11 @@ folder, remove one or pick a library folder:
 
 Every key is optional; hand-edit it and choose **Settings ▸ Reload config file**. `editor` can be
 `vscode`, `vscode-insiders`, `cursor` or `windsurf`. Set `ENVDECK_CONFIG` to use a different file.
-Delete it and EnvDeck starts empty. **Open folder for this session** scans without writing
-anything. EnvDeck makes no network calls.
+Delete it and EnvDeck starts empty (and shows the short first-run tour again; **Settings ▸ Show
+tutorial** opens it any time). **Open folder for this session** scans without writing
+anything. EnvDeck's only network request of its own is the update check against this repository's GitHub
+Releases (at launch and from **Settings ▸ Check for updates…**); **Push to GitHub** and **Push to
+Azure App Service** run the GitHub and Azure CLIs when you choose them.
 
 ## Shortcuts
 
@@ -67,7 +70,7 @@ Requires Node 22+ and stable Rust. See [AGENTS.md](AGENTS.md) for conventions an
 ```sh
 npm install
 npm run tauri dev       # the native app
-npm run dev:mock        # UI only, in a browser, against an in-memory mock (no Rust needed)
+npm run dev:mock        # UI only, in a browser, against an in-memory mock (no Rust needed); add ?fresh to the URL for a first run
 npm run build           # type-check + bundle (fails if the mock leaks into the bundle)
 npm run lint            # oxlint
 npm test                # Vitest
@@ -76,30 +79,38 @@ npm run smoke:native    # Windows: automated checks against the real app (see do
 npm run tauri build     # .app/.dmg on macOS, NSIS/MSI on Windows
 ```
 
-**GitHub sign-in** ("Push to GitHub") uses the **EnvDeck GitHub App**. To create it, go to GitHub →
-Settings → Developer settings → GitHub Apps → New GitHub App:
+**Push to GitHub** runs the [GitHub CLI](https://cli.github.com) with the user's own login. Users
+install `gh` and run `gh auth login` once. There is no EnvDeck GitHub App or OAuth App to set up,
+install or approve, so it works on organization repositories without an owner's approval, as long as
+the user can already change the repo's Actions secrets. EnvDeck never sees the token. For an
+organization with SAML SSO, authorize gh's token for the org when gh asks.
 
-- **Identifying and authorizing users:** tick **Enable Device Flow** and keep **Expire user
-  authorization tokens** on. The Callback URL can be any URL you own; it isn't used.
-- **Webhook:** untick **Active**.
-- **Repository permissions:** Secrets, Variables and Environments **Read and write**; Actions
-  **Read-only**; Metadata **Read-only**. No account or organization permissions, and not
-  Administration.
-- **Where can this GitHub App be installed:** "Any account" if other people will use EnvDeck.
-- Don't generate a client secret or private key for EnvDeck; the Device Flow doesn't need them.
-
-Then put the app's **client ID** (`Iv23li…`) and **slug** (from `github.com/apps/<slug>`) in
-[`src-tauri/.cargo/config.toml`](src-tauri/.cargo/config.toml). Neither is secret, so the file is
-committed, and local builds and the release workflow both use it. An environment variable with the
-same name overrides the file. Users install the app on the repositories they want to push to (EnvDeck links there),
-and need the [GitHub CLI](https://cli.github.com) installed (no `gh auth login` needed).
+**Push to Azure App Service** runs the [Azure CLI](https://aka.ms/azcli) with the user's own login
+(`az login` once). Pick a subscription, app and slot (preselected from `.azure/config` beside the
+file, as written by `az webapp up`), then send each key to an app setting, a connection string, a
+general setting (startup command, always on, TLS, ...) or Deployment Center (container image and
+registry, source repository and branch). Existing settings are kept; EnvDeck never deletes any.
+Saving restarts the app. After a push to either service, EnvDeck offers to push the same keys to
+the other.
 
 ## Release
 
-1. Bump `version` in `package.json`, `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json`.
+1. `npm run release:version -- X.Y.Z` sets the version in `package.json`, `package-lock.json`,
+   `src-tauri/Cargo.toml`, `Cargo.lock` and `src-tauri/tauri.conf.json`. Commit it.
 2. Run the [native smoke test](docs/SMOKE_TEST.md) on both OSes.
-3. Push a tag `vX.Y.Z`. The Release workflow builds Windows and macOS (universal) installers and
-   attaches them to a draft GitHub release.
+3. Push a tag `vX.Y.Z`. The Release workflow builds Windows and macOS (universal) installers,
+   signed updater bundles and `latest.json`, and attaches them to a draft GitHub release.
+4. Check the draft, then **publish** it. Installed copies only see the update once it's published
+   (they read `releases/latest`). The update dialog shows the notes in `latest.json`, which come
+   from `releaseBody` in the workflow at build time; editing the release text afterwards doesn't
+   change them.
+
+**Update signing (one-time setup).** Run `npm run tauri signer generate -- -w ~/.tauri/envdeck.key`,
+put the printed public key in `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`, and add the
+private key's contents and its password as the `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets. Keep the private key safe: without it,
+installed copies can't be updated. A local `npm run tauri build` needs the same two environment
+variables, because `createUpdaterArtifacts` is on.
 
 **Signing.** macOS: add `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
 `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` (app-specific) and `APPLE_TEAM_ID` as

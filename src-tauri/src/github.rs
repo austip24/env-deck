@@ -1,9 +1,10 @@
 //! Push dotenv keys to GitHub Actions secrets and variables by running the `gh` CLI.
 //!
-//! The user signs in to the EnvDeck GitHub App inside EnvDeck (Device Flow, github_auth.rs); the
-//! token is passed to `gh` as `GH_TOKEN` for each run and is never written anywhere. It only
-//! reaches repositories where the app is installed (`check_installed`). `gh` does the API
-//! calls and the secret encryption. This is the only module that spawns processes.
+//! Authentication is the GitHub CLI's own login (`gh auth login`, or `GH_TOKEN` in gh's
+//! environment): EnvDeck never sees, receives or stores a token, and needs no GitHub App or
+//! OAuth App, so no organization owner has to approve anything. Whatever the user can change
+//! with `gh` they can change here. `gh` does the API calls and the secret encryption; EnvDeck
+//! makes no network requests itself. Processes are spawned through `cli.rs`.
 //!
 //! - The repository comes from `.git` in the same folder as the `.env` file (Rust reads it; the
 //!   webview only names a remote).
@@ -13,13 +14,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cli;
 use crate::error::{Error, Result};
 use crate::fsops;
-use crate::github_auth::Token;
 
 // ---------------------------------------------------------------------------------------------
 // Repository detection
@@ -196,109 +197,78 @@ pub trait Gh: Sync {
 
 pub struct GhCli {
     exe: PathBuf,
-    token: Token,
 }
 
 impl GhCli {
     /// Finds `gh` on `PATH`, then in the usual install folders (apps started from Finder don't
     /// get the shell's `PATH`).
-    pub fn locate(token: Token) -> Result<Self> {
+    pub fn locate() -> Result<Self> {
         let file = if cfg!(windows) { "gh.exe" } else { "gh" };
-        let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).map(|d| d.join(file)).collect())
-            .unwrap_or_default();
+        let mut extra: Vec<PathBuf> = Vec::new();
         if cfg!(windows) {
             for var in ["ProgramFiles", "ProgramFiles(x86)"] {
                 if let Some(base) = std::env::var_os(var) {
-                    candidates.push(PathBuf::from(base).join("GitHub CLI").join(file));
+                    extra.push(PathBuf::from(base).join("GitHub CLI"));
                 }
             }
             if let Some(local) = dirs::data_local_dir() {
-                candidates.push(local.join("Programs").join("GitHub CLI").join(file));
+                extra.push(local.join("Programs").join("GitHub CLI"));
             }
         } else {
-            candidates.extend(
-                ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-                    .iter()
-                    .map(|d| Path::new(d).join(file)),
-            );
+            extra = cli::unix_bin_dirs();
         }
-        candidates
-            .into_iter()
-            .find(|p| p.is_file())
-            .map(|exe| GhCli { exe, token })
+        cli::find(file, &extra)
+            .map(|exe| GhCli { exe })
             .ok_or(Error::GhMissing)
     }
 }
 
 impl Gh for GhCli {
     fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String> {
-        use std::io::Write;
         let mut cmd = Command::new(&self.exe);
+        // gh's own credentials (its keyring/config, or GH_TOKEN in the environment) are used as
+        // they are; EnvDeck passes no token. Every call names its host (`--repo host/owner/name`
+        // or `--hostname`).
         cmd.args(args)
-            // EnvDeck's sign-in, not whatever gh or the environment is logged in as.
-            .env("GH_TOKEN", self.token.expose())
-            .env("GH_HOST", "github.com")
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_ENTERPRISE_TOKEN")
-            .env_remove("GITHUB_ENTERPRISE_TOKEN")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("NO_COLOR", "1")
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = cmd.spawn().map_err(|e| match e.kind() {
+            .env("NO_COLOR", "1");
+        let out = cli::run(cmd, stdin).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Error::GhMissing,
             _ => Error::Gh(format!("Couldn't run gh: {e}")),
         })?;
-        if let Some(body) = stdin
-            && let Some(mut pipe) = child.stdin.take()
-        {
-            pipe.write_all(body.as_bytes())
-                .map_err(|e| Error::Gh(format!("Couldn't write to gh: {e}")))?;
-            // Dropping the pipe closes stdin so gh stops reading.
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| Error::Gh(format!("gh failed: {e}")))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        if out.success {
+            Ok(out.stdout)
         } else {
-            Err(gh_error(&String::from_utf8_lossy(&out.stderr)))
+            Err(gh_error(&out.stderr))
         }
     }
 }
 
-/// The useful part of gh's stderr, capped so a chatty failure doesn't flood a toast.
 fn gh_message(stderr: &str) -> String {
-    let msg = stderr.trim();
-    let msg = if msg.is_empty() { "gh failed" } else { msg };
-    let mut out: String = msg.chars().take(400).collect();
-    if out.len() < msg.len() {
-        out.push('…');
-    }
-    out
+    cli::message(stderr, "gh failed")
 }
 
-/// A failed run: a rejected token becomes `GhAuth` so the UI asks to sign in again.
+/// What the UI shows when gh has no usable login.
+pub const NOT_SIGNED_IN: &str =
+    "The GitHub CLI isn't signed in to GitHub. Run gh auth login in a terminal, then try again.";
+
+/// A failed run: gh without a (valid) login becomes `GhAuth` so the UI shows how to sign in.
 fn gh_error(stderr: &str) -> Error {
-    if stderr.contains("HTTP 401") || stderr.contains("Bad credentials") {
-        Error::GhAuth("GitHub rejected the sign-in. Sign in again.".into())
-    } else if stderr.contains("Resource not accessible by integration") {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("gh auth login")
+        || lower.contains("not logged in")
+        || lower.contains("http 401")
+        || lower.contains("bad credentials")
+    {
+        Error::GhAuth(NOT_SIGNED_IN.into())
+    } else if lower.contains("saml") {
+        // gh's message names the organization and the URL to authorize the token at.
+        Error::Gh(gh_message(stderr))
+    } else if lower.contains("http 403") || lower.contains("http 404") {
         Error::Gh(format!(
-            "GitHub refused: the EnvDeck GitHub App lacks a permission for this, or isn't \
-             installed on the repository, or you can't change it. ({})",
+            "GitHub refused: you need write access to the repository (admin for some lists), \
+             and gh's token needs the repo scope (gh auth refresh -s repo). ({})",
             gh_message(stderr)
         ))
     } else {
@@ -336,6 +306,8 @@ pub struct Names {
 #[serde(rename_all = "camelCase")]
 pub struct GithubState {
     pub repo: String,
+    /// The account gh is signed in as on the repository's host.
+    pub login: String,
     pub environments: Vec<String>,
     /// Repository-level secrets and variables.
     pub repo_names: Names,
@@ -389,63 +361,27 @@ fn list_environments(gh: &dyn Gh, repo: &Remote) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Fails with `NotInstalled` unless the EnvDeck GitHub App is installed on the repository, on
-/// an installation the signed-in user can access (`GET /user/installations`).
-pub fn check_installed(gh: &dyn Gh, repo: &Remote) -> Result<()> {
-    let installs = gh.run(
-        &args(&[
-            "api",
-            "--hostname",
-            &repo.host,
-            "--paginate",
-            "user/installations",
-            "--jq",
-            ".installations[] | [(.id | tostring), .account.login, .repository_selection] | @tsv",
-        ]),
+/// The account gh is signed in as on the repository's host. Doubles as the sign-in check:
+/// without a login gh fails and `gh_error` turns that into `GhAuth`.
+pub fn whoami(gh: &dyn Gh, repo: &Remote) -> Result<String> {
+    let out = gh.run(
+        &args(&["api", "--hostname", &repo.host, "user", "--jq", ".login"]),
         None,
     )?;
-    let full_name = format!("{}/{}", repo.owner, repo.name);
-    for line in installs.lines() {
-        let mut cols = line.trim().split('\t');
-        let (Some(id), Some(account), Some(selection)) = (cols.next(), cols.next(), cols.next())
-        else {
-            continue;
-        };
-        if !account.eq_ignore_ascii_case(&repo.owner) || !id.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        if selection == "all" {
-            return Ok(());
-        }
-        let path = format!("user/installations/{id}/repositories");
-        let repos = gh.run(
-            &args(&[
-                "api",
-                "--hostname",
-                &repo.host,
-                "--paginate",
-                &path,
-                "--jq",
-                ".repositories[].full_name",
-            ]),
-            None,
-        )?;
-        if repos
-            .lines()
-            .any(|r| r.trim().eq_ignore_ascii_case(&full_name))
-        {
-            return Ok(());
-        }
+    let login = out.trim();
+    if login.is_empty() {
+        return Err(Error::GhAuth(NOT_SIGNED_IN.into()));
     }
-    Err(Error::NotInstalled(full_name))
+    Ok(login.to_string())
 }
 
 /// Environments plus the names of existing secrets and variables, so the UI can say which keys
 /// would be replaced. GitHub never returns secret values, and variable values aren't fetched.
 pub fn inspect(gh: &dyn Gh, repo: &Remote) -> Result<GithubState> {
-    check_installed(gh, repo)?;
+    let login = whoami(gh, repo)?;
     let mut state = GithubState {
         repo: format!("{}/{}", repo.owner, repo.name),
+        login,
         ..Default::default()
     };
     // The repository's secret list doubles as the access check: if it fails, nothing else will.
@@ -569,15 +505,15 @@ fn check_item(item: &PushItem, value: Option<&str>) -> std::result::Result<(), S
 }
 
 /// Sets each item from `vars` (the file's values, read by Rust). Items are independent: one
-/// failure is reported and the rest still run. Environments must already exist: creating them
-/// needs the `Administration` permission, which the EnvDeck GitHub App deliberately lacks.
+/// failure is reported and the rest still run. Environments must already exist: EnvDeck never
+/// creates them (that changes repository settings, which is left to GitHub's own UI).
 pub fn push(
     gh: &dyn Gh,
     repo: &Remote,
     vars: &[(String, String)],
     items: &[PushItem],
 ) -> Result<Vec<PushResult>> {
-    // A rejected sign-in stops everything (the UI asks to sign in again); other failures are
+    // gh without a login stops everything (the UI shows `gh auth login`); other failures are
     // reported per item.
     let environments = if items.iter().any(|i| i.environment.is_some()) {
         match list_environments(gh, repo) {
@@ -902,9 +838,9 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_token_stops_push_and_inspect() {
+    fn without_a_gh_login_push_and_inspect_stop() {
         let gh = FakeGh {
-            fail_on: vec!["set", "list", "installations"],
+            fail_on: vec!["set", "list", " user "],
             stderr: "HTTP 401: Bad credentials (https://api.github.com/...)",
             ..Default::default()
         };
@@ -914,19 +850,81 @@ mod tests {
         ];
         let err = push(&gh, &repo(), &vars(), &items).unwrap_err();
         assert!(err.to_string().starts_with("GH_AUTH: "), "{err}");
+        assert!(err.to_string().contains("gh auth login"), "{err}");
         assert_eq!(gh.calls.lock().unwrap().len(), 1, "stops at the first 401");
+        gh.calls.lock().unwrap().clear();
         assert!(matches!(inspect(&gh, &repo()), Err(Error::GhAuth(_))));
+        assert_eq!(gh.calls.lock().unwrap().len(), 1, "nothing is listed");
 
         let gh = FakeGh {
             fail_on: vec!["set"],
-            stderr: "HTTP 403: Resource not accessible by integration",
+            stderr: "HTTP 403: Resource not accessible by personal access token",
             ..Default::default()
         };
         let results = push(&gh, &repo(), &vars(), &items).unwrap();
         assert!(results.iter().all(|r| {
             let e = r.error.as_deref().unwrap();
-            e.contains("403") && e.contains("EnvDeck GitHub App")
+            e.contains("403") && e.contains("write access")
         }));
+    }
+
+    #[test]
+    fn classifies_gh_failures() {
+        let auth = |stderr: &str| matches!(gh_error(stderr), Error::GhAuth(_));
+        assert!(auth(
+            "To get started with GitHub CLI, please run:  gh auth login
+             Alternatively, populate the GH_TOKEN environment variable with a GitHub API              authentication token."
+        ));
+        assert!(auth(
+            "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+        ));
+        assert!(auth(
+            "HTTP 401: Bad credentials (https://api.github.com/user)"
+        ));
+        // SAML SSO: gh's own message carries the URL to authorize the token at.
+        let sso = gh_error(
+            "HTTP 403: Resource protected by organization SAML enforcement. You must grant your              OAuth token access to this organization. (https://github.com/orgs/acme/sso?x=1)",
+        );
+        assert!(
+            matches!(&sso, Error::Gh(m) if m.contains("/orgs/acme/sso")),
+            "{sso}"
+        );
+        assert!(
+            matches!(gh_error("HTTP 404: Not Found"), Error::Gh(m) if m.contains("repo scope"))
+        );
+        assert!(matches!(gh_error("something else"), Error::Gh(m) if m == "something else"));
+    }
+
+    #[test]
+    fn whoami_reads_the_login_for_the_repo_host() {
+        let gh = FakeGh {
+            stdout: BTreeMap::from([(
+                ".login", "octocat
+",
+            )]),
+            ..Default::default()
+        };
+        let remote = Remote {
+            host: "ghe.example.com".into(),
+            ..repo()
+        };
+        assert_eq!(whoami(&gh, &remote).unwrap(), "octocat");
+        assert_eq!(
+            gh.calls.lock().unwrap()[0].0,
+            [
+                "api",
+                "--hostname",
+                "ghe.example.com",
+                "user",
+                "--jq",
+                ".login"
+            ]
+        );
+        // Empty output: treat as signed out rather than show "@".
+        assert!(matches!(
+            whoami(&FakeGh::default(), &repo()),
+            Err(Error::GhAuth(_))
+        ));
     }
 
     #[test]
@@ -934,8 +932,16 @@ mod tests {
         let gh = FakeGh {
             fail_on: vec!["variable list --json name --repo github.com/acme/shop --env staging"],
             stdout: BTreeMap::from([
-                ("installations", "7\tacme\tall\n"),
-                ("environments", "production\nstaging\n"),
+                (
+                    ".login", "octocat
+",
+                ),
+                (
+                    "environments",
+                    "production
+staging
+",
+                ),
                 ("--env production", r#"[{"name":"DB_URL"}]"#),
                 ("--env staging", r#"[{"name":"STAGE_KEY"}]"#),
                 ("list", r#"[{"name":"API_KEY"}]"#),
@@ -944,6 +950,7 @@ mod tests {
         };
         let state = inspect(&gh, &repo()).unwrap();
         assert_eq!(state.repo, "acme/shop");
+        assert_eq!(state.login, "octocat");
         assert_eq!(state.environments, ["production", "staging"]);
         assert_eq!(state.repo_names.secrets, ["API_KEY"]);
         assert_eq!(state.repo_names.variables, ["API_KEY"]);
@@ -951,51 +958,12 @@ mod tests {
         assert_eq!(state.env_names["staging"].secrets, ["STAGE_KEY"]);
         assert!(state.env_names["staging"].variables.is_empty());
         assert_eq!(state.warnings.len(), 1);
-    }
-
-    fn installed(installs: &'static str, repos: &'static str) -> Result<()> {
-        let gh = FakeGh {
-            // "/repositories" sorts first, so the per-installation call matches it.
-            stdout: BTreeMap::from([("/repositories", repos), ("installations", installs)]),
-            ..Default::default()
-        };
-        check_installed(&gh, &repo())
-    }
-
-    #[test]
-    fn checks_the_app_is_installed_on_the_repository() {
-        // All repositories of the owner.
-        assert!(installed("7\tACME\tall\n", "").is_ok());
-        // Selected repositories, including this one.
-        assert!(installed("7\tacme\tselected\n", "acme/web\nacme/shop\n").is_ok());
-        // Selected repositories, not this one.
-        let err = installed("7\tacme\tselected\n", "acme/web\n").unwrap_err();
-        assert!(err.to_string().starts_with("GH_NOT_INSTALLED: "), "{err}");
-        assert!(err.to_string().contains("acme/shop"));
-        // Only installed on another account, or nowhere.
-        assert!(matches!(
-            installed("8\tother\tall\n", ""),
-            Err(Error::NotInstalled(_))
-        ));
-        assert!(matches!(installed("", ""), Err(Error::NotInstalled(_))));
-        // Malformed ids are ignored rather than put into a URL.
-        assert!(matches!(
-            installed("../x\tacme\tselected\n", "acme/shop\n"),
-            Err(Error::NotInstalled(_))
-        ));
-    }
-
-    #[test]
-    fn inspect_stops_when_the_app_isnt_installed() {
-        let gh = FakeGh::default();
-        assert!(matches!(inspect(&gh, &repo()), Err(Error::NotInstalled(_))));
-        assert_eq!(gh.calls.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn gh_messages_are_trimmed_and_capped() {
-        assert_eq!(gh_message("  \n"), "gh failed");
-        assert_eq!(gh_message("HTTP 404\n"), "HTTP 404");
-        assert_eq!(gh_message(&"x".repeat(500)).chars().count(), 401);
+        // No GitHub App: nothing asks where an app is installed.
+        let calls = gh.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|(a, _)| a.join(" ").contains("installations"))
+        );
     }
 }

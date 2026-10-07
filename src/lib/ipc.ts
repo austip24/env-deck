@@ -162,25 +162,12 @@ export interface GithubNames {
 export interface GithubState {
   /** `owner/name`. */
   repo: string;
+  /** The account the GitHub CLI (`gh auth login`) is signed in as on the repository's host. */
+  login: string;
   environments: string[];
   repoNames: GithubNames;
   envNames: Record<string, GithubNames>;
   warnings: string[];
-}
-
-/** Sign-in state (github_auth.rs). The token itself never reaches the webview. */
-export interface GithubAccount {
-  /** This build has a GitHub OAuth client ID. */
-  configured: boolean;
-  login: string | null;
-}
-
-/** OAuth Device Flow: the code to enter at `verificationUri`. */
-export interface GithubDeviceLogin {
-  userCode: string;
-  verificationUri: string;
-  /** Seconds. */
-  expiresIn: number;
 }
 
 export type GithubKind = "secret" | "variable";
@@ -195,6 +182,107 @@ export interface GithubPushItem {
 export interface GithubPushResult extends GithubPushItem {
   /** null on success. */
   error: string | null;
+}
+
+// --- Azure App Service (azure.rs) -------------------------------------------------------------
+
+/** The app named in `.azure/config` beside the file (written by `az webapp up`). */
+export interface AzureHint {
+  group: string | null;
+  web: string | null;
+}
+
+export interface AzureSubscription {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
+export interface AzureAccount {
+  /** The account the Azure CLI (`az login`) is signed in as. */
+  user: string;
+  /** Enabled subscriptions, the CLI's default first. */
+  subscriptions: AzureSubscription[];
+}
+
+export interface AzureSite {
+  /** ARM resource id. */
+  id: string;
+  name: string;
+  resourceGroup: string;
+  /** `app`, `app,linux`, `functionapp,linux`, ... */
+  kind: string;
+  location: string;
+}
+
+export type AzureFieldKind = "text" | "path" | "bool" | "count" | "choice";
+
+/** A setting besides app settings and connection strings (catalog in azure.rs). */
+export interface AzureField {
+  id: string;
+  label: string;
+  section: "general" | "deployment";
+  kind: AzureFieldKind;
+  choices: string[];
+  secret: boolean;
+  /** The app setting a registry field writes, for "replaces". */
+  appSetting: string | null;
+  /** Where the field writes; two rows with the same target conflict. */
+  target: string;
+  note: string | null;
+}
+
+/** What already exists on the app or slot. Names only: values never leave Rust. */
+export interface AzureState {
+  site: string;
+  slot: string | null;
+  linux: boolean;
+  appSettings: string[];
+  connectionStrings: string[];
+  stickyAppSettings: string[];
+  stickyConnectionStrings: string[];
+  fields: AzureField[];
+  connectionTypes: string[];
+  warnings: string[];
+}
+
+export type AzureDest = "appSetting" | "connectionString" | "field";
+
+export interface AzurePushItem {
+  /** The key in the file; Rust reads its value. */
+  key: string;
+  dest: AzureDest;
+  /** App setting or connection string name (defaults to `key`). */
+  name: string | null;
+  /** Catalog id when `dest` is `field`. */
+  field: string | null;
+  connType: string | null;
+  slotSetting: boolean;
+}
+
+export interface AzurePushResult {
+  key: string;
+  /** null on success. */
+  error: string | null;
+}
+
+export type AzurePortalPage = "environment" | "configuration" | "deploymentCenter";
+
+// --- updates (update.rs) ----------------------------------------------------------------------
+
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  /** Release notes, trimmed; null when the release has none. */
+  notes: string | null;
+  /** RFC 3339 publish date. */
+  date: string | null;
+}
+
+export interface UpdateProgress {
+  downloaded: number;
+  /** Null when the server didn't send a length. */
+  total: number | null;
 }
 
 // --- commands ---------------------------------------------------------------------------------
@@ -218,8 +306,12 @@ export const ipc = {
   /** Save edited text; fails with a STALE error if the file changed since `expectedModifiedMs`. */
   writeConfig: (path: string, content: string, expectedModifiedMs: number) =>
     invoke<number>("write_config", { path, content, expectedModifiedMs }),
-  /** Upsert variables into a dotenv file. Returns the new mtime. */
-  setEnvVars: (path: string, vars: EnvVar[]) => invoke<number>("set_env_vars", { path, vars }),
+  /**
+   * Upsert variables into a dotenv file. Returns the new mtime. With `expectedModifiedMs` (an
+   * edit of the loaded file), fails with STALE if the file changed since.
+   */
+  setEnvVars: (path: string, vars: EnvVar[], expectedModifiedMs?: number) =>
+    invoke<number>("set_env_vars", { path, vars, expectedModifiedMs: expectedModifiedMs ?? null }),
 
   /** Native folder picker that grants writes to the folder for this session. */
   pickDestination: () => invoke<string | null>("pick_destination"),
@@ -233,25 +325,37 @@ export const ipc = {
   /** Call from a pointer-down / drag-start handler. */
   startDrag: (path: string) => invoke<void>("start_drag", { path }),
 
-  /** GitHub sign-in (OAuth Device Flow); the token stays in Rust memory. */
-  githubAccount: () => invoke<GithubAccount>("github_account"),
-  /** Starts sign-in: returns the code and opens github.com/login/device from Rust. */
-  githubSignInStart: () => invoke<GithubDeviceLogin>("github_sign_in_start"),
-  /** Resolves once the code is approved; rejects (GH_AUTH) if it expires or is cancelled. */
-  githubSignInWait: () => invoke<GithubAccount>("github_sign_in_wait"),
-  githubOpenVerification: () => invoke<void>("github_open_verification"),
-  /** Forgets the in-memory token; also cancels a sign-in in progress. */
-  githubSignOut: () => invoke<GithubAccount>("github_sign_out"),
   /** GitHub remotes of the repo whose `.git` is next to this dotenv file (NO_REPO if none). */
   githubRepo: (path: string) => invoke<GithubRepoInfo>("github_repo", { path }),
-  /** Runs `gh` with the session's sign-in: environments and existing names. GH_AUTH when signed out. */
+  /** Runs `gh` with its own login: who, environments and existing names. GH_AUTH when gh isn't signed in. */
   githubInspect: (path: string, remote: string) => invoke<GithubState>("github_inspect", { path, remote }),
   /** Sets each item from the file's current value (read by Rust); results are per item. */
   githubPush: (path: string, remote: string, items: GithubPushItem[]) =>
     invoke<GithubPushResult[]>("github_push", { path, remote, items }),
-  /** Opens the EnvDeck GitHub App's install page or the repo's environment settings (URL built in Rust). */
-  githubOpenPage: (path: string, remote: string, page: "install" | "environments") =>
+  /** Opens the repo's environment settings on GitHub (URL built in Rust). */
+  githubOpenPage: (path: string, remote: string, page: "environments") =>
     invoke<void>("github_open_page", { path, remote, page }),
+
+  /** The app named in `.azure/config` beside this dotenv file, or null. Reads one file. */
+  azureHint: (path: string) => invoke<AzureHint | null>("azure_hint", { path }),
+  /** Runs `az` with its own login: who and which subscriptions. AZ_AUTH when az isn't signed in. */
+  azureAccount: () => invoke<AzureAccount>("azure_account"),
+  /** App Services in a subscription; only these can be pushed to this session. */
+  azureListApps: (subscription: string) => invoke<AzureSite[]>("azure_list_apps", { subscription }),
+  azureListSlots: (siteId: string) => invoke<string[]>("azure_list_slots", { siteId }),
+  /** Existing names on the app (slot null) or a slot, plus the settings catalog. */
+  azureInspect: (siteId: string, slot: string | null) => invoke<AzureState>("azure_inspect", { siteId, slot }),
+  /** Sets each item from the file's current value (read by Rust); results are per item. */
+  azurePush: (path: string, siteId: string, slot: string | null, items: AzurePushItem[]) =>
+    invoke<AzurePushResult[]>("azure_push", { path, siteId, slot, items }),
+  /** Opens a portal page for the app or slot (URL built in Rust). */
+  azureOpenPortal: (siteId: string, slot: string | null, page: AzurePortalPage) =>
+    invoke<void>("azure_open_portal", { siteId, slot, page }),
+
+  /** Asks EnvDeck's GitHub Releases for a newer version; null when up to date. */
+  checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
+  /** Installs the update the last check found and restarts (NO_UPDATE without one). */
+  installUpdate: () => invoke<void>("install_update"),
 
   // Plugin calls (permissions in capabilities/default.json).
   /** Plain text to the clipboard (clipboard-manager:allow-write-text). */
@@ -265,6 +369,11 @@ export function onConfigsChanged(cb: (paths: string[]) => void): Promise<Unliste
   return listen<{ paths: string[] }>("configs-changed", (e) => cb(e.payload.paths));
 }
 
+/** Download progress while an update installs. */
+export function onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update-progress", (e) => cb(e.payload));
+}
+
 // --- errors -----------------------------------------------------------------------------------
 
 /** Stable prefixes Rust puts on errors the UI reacts to (see error.rs). */
@@ -273,11 +382,12 @@ export type ErrorCode =
   | "EXISTS"
   | "GH_MISSING"
   | "GH_AUTH"
-  | "GH_NO_CLIENT"
-  | "GH_NOT_INSTALLED"
-  | "NO_REPO";
+  | "NO_REPO"
+  | "AZ_MISSING"
+  | "AZ_AUTH"
+  | "NO_UPDATE";
 
-const CODE_RE = /^(STALE|EXISTS|GH_MISSING|GH_AUTH|GH_NO_CLIENT|GH_NOT_INSTALLED|NO_REPO): /;
+const CODE_RE = /^(STALE|EXISTS|GH_MISSING|GH_AUTH|NO_REPO|AZ_MISSING|AZ_AUTH|NO_UPDATE): /;
 
 export function errorCode(e: unknown): ErrorCode | null {
   const m = CODE_RE.exec(rawError(e));

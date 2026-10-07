@@ -33,8 +33,8 @@ notify-debouncer-full = "0.5"
 clipboard-rs = "0.3"
 dunce = "1"
 dirs = "6"
-# HTTP for "Sign in with GitHub" (OAuth Device Flow) only; see github_auth.rs.
-ureq = { version = "3", features = ["json"] }
+# In-app updates from GitHub Releases, driven from Rust only (update.rs); no webview permission.
+tauri-plugin-updater = "2"
 
 [dev-dependencies]
 tempfile = "3"

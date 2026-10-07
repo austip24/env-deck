@@ -12,7 +12,8 @@
     "test": "vitest run",
     "test:rust": "npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri",
-    "smoke:native": "node scripts/native-smoke.mjs"
+    "smoke:native": "node scripts/native-smoke.mjs",
+    "release:version": "node scripts/bump-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

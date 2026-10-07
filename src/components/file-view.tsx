@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Eye, EyeOff, FilePlus2, RefreshCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
+import { AzurePushDialog } from "@/components/azure-push-dialog";
 import { CompareView } from "@/components/compare-view";
 import { CopyToDialog } from "@/components/copy-to-dialog";
 import { EnvTable, type Reveal } from "@/components/env-table";
@@ -11,17 +12,30 @@ import { SendToDialog } from "@/components/send-to-dialog";
 import { SourceEditor } from "@/components/source-editor";
 import { SourceView, structuredSecretLines } from "@/components/source-view";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { CopyActions } from "@/hooks/use-copy";
+import { crossPromptFor, SERVICE_LABELS, type CrossPrompt, type PushService } from "@/lib/cross-push";
 import { effectiveVars, isSecret, pairsOf, templateTarget } from "@/lib/env";
 import {
+  errorCode,
   errorText,
   ipc,
   type ConfigContent,
+  type AzureHint,
   type ConfigFile,
   type GithubRepoInfo,
   type ScanResult,
@@ -61,8 +75,16 @@ export function FileView({
   const [githubOpen, setGithubOpen] = useState(false);
   const [githubRepo, setGithubRepo] = useState<GithubRepoInfo | null>(null);
   const [githubReason, setGithubReason] = useState<string | null>(null);
+  const [azureOpen, setAzureOpen] = useState(false);
+  const [azureHint, setAzureHint] = useState<AzureHint | null>(null);
+  // After a push to one service, offer the same keys to the other. A push started from that
+  // offer starts with exactly those keys checked and doesn't offer back.
+  const [pushPreset, setPushPreset] = useState<Set<string> | null>(null);
+  const [crossPrompt, setCrossPrompt] = useState<CrossPrompt | null>(null);
+  const pushed = useRef<{ from: PushService; keys: string[] } | null>(null);
 
-  // A dotenv file with `.git` beside it can be pushed to GitHub. Detection only reads files.
+  // A dotenv file with `.git` beside it can be pushed to GitHub; `.azure/config` beside it
+  // preselects an Azure app. Detection only reads files.
   const isDotenv = !!env;
   useEffect(() => {
     if (!isDotenv) return;
@@ -71,10 +93,39 @@ export function FileView({
       .githubRepo(content.path)
       .then((r) => live && (setGithubRepo(r), setGithubReason(null)))
       .catch((e) => live && (setGithubRepo(null), setGithubReason(errorText(e))));
+    ipc
+      .azureHint(content.path)
+      .then((h) => live && setAzureHint(h))
+      .catch(() => live && setAzureHint(null));
     return () => {
       live = false;
     };
   }, [content.path, isDotenv]);
+
+  const setPushOpen = (service: PushService, open: boolean) =>
+    service === "github" ? setGithubOpen(open) : setAzureOpen(open);
+
+  const openPush = (service: PushService, preset: Set<string> | null = null) => {
+    pushed.current = null;
+    setPushPreset(preset);
+    setPushOpen(service, true);
+  };
+
+  const recordPushed = (from: PushService) => (keys: string[]) => {
+    const before = pushed.current?.from === from ? pushed.current.keys : [];
+    pushed.current = { from, keys: [...before, ...keys] };
+  };
+
+  /** Closing a push dialog offers the other service for what was pushed. */
+  const pushOpenChange = (service: PushService) => (open: boolean) => {
+    setPushOpen(service, open);
+    if (open) return;
+    const done = pushed.current;
+    pushed.current = null;
+    const chained = pushPreset !== null;
+    setPushPreset(null);
+    if (done?.from === service) setCrossPrompt(crossPromptFor(service, done.keys, !!githubRepo, chained));
+  };
 
   const secretCount = useMemo(
     () =>
@@ -104,6 +155,23 @@ export function FileView({
   const startEditing = () => {
     setTab("source");
     setEditing(true);
+  };
+
+  /** Saves one value edited in the table. Refused if the file changed since it was loaded. */
+  const editValue = async (key: string, value: string): Promise<boolean> => {
+    try {
+      await ipc.setEnvVars(content.path, [{ key, value }], content.modifiedMs);
+      toast.success(`Saved ${key}`);
+      await afterWrite();
+      return true;
+    } catch (e) {
+      if (errorCode(e) === "STALE") {
+        toast.error(errorText(e), { action: { label: "Reload", onClick: () => void afterWrite() } });
+      } else {
+        toast.error(errorText(e));
+      }
+      return false;
+    }
   };
 
   const createFromTemplate = async () => {
@@ -159,9 +227,10 @@ export function FileView({
               onEdit={startEditing}
               onCopyTo={() => setCopyToOpen(true)}
               onSendTo={() => setSendToOpen(true)}
-              onPushToGithub={() => setGithubOpen(true)}
+              onPushToGithub={() => openPush("github")}
               githubRepo={githubRepo}
               githubUnavailable={githubReason}
+              onPushToAzure={() => openPush("azure")}
             />
           </div>
         </div>
@@ -234,6 +303,7 @@ export function FileView({
                 onToggleReveal={toggleLine}
                 selected={selected}
                 onSelectedChange={setSelected}
+                onEditValue={editValue}
               />
             </TabsContent>
           )}
@@ -273,14 +343,55 @@ export function FileView({
       {githubOpen && githubRepo && allVars && (
         <GithubPushDialog
           open={githubOpen}
-          onOpenChange={setGithubOpen}
+          onOpenChange={pushOpenChange("github")}
           sourcePath={content.path}
           repo={githubRepo}
           vars={allVars}
-          selected={selected}
+          selected={pushPreset ?? selected}
           revealAll={reveal.all}
+          onPushed={recordPushed("github")}
         />
       )}
+      {azureOpen && allVars && (
+        <AzurePushDialog
+          open={azureOpen}
+          onOpenChange={pushOpenChange("azure")}
+          sourcePath={content.path}
+          hint={azureHint}
+          vars={allVars}
+          selected={pushPreset ?? selected}
+          revealAll={reveal.all}
+          onPushed={recordPushed("azure")}
+        />
+      )}
+      <AlertDialog open={crossPrompt !== null} onOpenChange={(open) => !open && setCrossPrompt(null)}>
+        <AlertDialogContent>
+          {crossPrompt && (
+            <>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Also push to {SERVICE_LABELS[crossPrompt.to]}?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {crossPrompt.keys.length === 1 ? "This key was" : `These ${crossPrompt.keys.length} keys were`}{" "}
+                  pushed. You can push the same {crossPrompt.keys.length === 1 ? "key" : "keys"} to{" "}
+                  {crossPrompt.to === "github" && githubRepo
+                    ? `${githubRepo.remotes[0].owner}/${githubRepo.remotes[0].name} on GitHub`
+                    : "an Azure App Service"}{" "}
+                  too. Nothing is sent until you pick where and choose Push.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <p className="selectable line-clamp-3 font-mono text-xs break-all text-muted-foreground">
+                {crossPrompt.keys.join(", ")}
+              </p>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Not now</AlertDialogCancel>
+                <AlertDialogAction onClick={() => openPush(crossPrompt.to, new Set(crossPrompt.keys))}>
+                  Push to {SERVICE_LABELS[crossPrompt.to]}…
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </>
+          )}
+        </AlertDialogContent>
+      </AlertDialog>
     </Tabs>
   );
 }

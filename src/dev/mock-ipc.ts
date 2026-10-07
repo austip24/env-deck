@@ -7,12 +7,17 @@
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
+  AzureAccount,
+  AzureField,
+  AzurePushItem,
+  AzurePushResult,
+  AzureSite,
+  AzureState,
   ConfigContent,
   ConfigFile,
   CopyOutcome,
   EnvVar,
   FolderView,
-  GithubAccount,
   GithubPushItem,
   GithubPushResult,
   GithubRemote,
@@ -23,6 +28,7 @@ import type {
   ScanResult,
   Settings,
   SettingsUpdate,
+  UpdateInfo,
 } from "@/lib/ipc";
 import {
   detectEnding,
@@ -33,6 +39,7 @@ import {
   templateTarget,
   upsert,
 } from "@/dev/mock-dotenv";
+import { fieldValueProblem, isValidSettingName } from "@/lib/azure";
 import { effectiveVars } from "@/lib/env";
 
 // Sentinel checked by scripts/check-bundle.mjs; do not remove.
@@ -96,6 +103,8 @@ function seed() {
   );
 
   put(`${shop}/apps/api/package.json`, "{}\n");
+  // Written by `az webapp up`: preselects the app in "Push to Azure".
+  put(`${shop}/apps/api/.azure/config`, "[defaults]\ngroup = shop-rg\nweb = shop-api\nsku = B1\n");
   put(
     `${shop}/apps/api/.env`,
     [
@@ -165,10 +174,13 @@ const DEFAULT_SETTINGS: Settings = {
   editor: "vscode",
 };
 
+// `?fresh` starts with an empty manifest, like a first run (shows the tutorial).
+const fresh = typeof location !== "undefined" && new URLSearchParams(location.search).has("fresh");
+
 const state = {
-  savedRoots: ["~/code"],
+  savedRoots: fresh ? [] : ["~/code"],
   sessionRoots: [] as string[],
-  library: "~/dev-configs" as string | null,
+  library: (fresh ? null : "~/dev-configs") as string | null,
   settings: { ...DEFAULT_SETTINGS },
   grants: [] as string[],
 };
@@ -319,8 +331,11 @@ function readConfig(path: string): ConfigContent {
   };
 }
 
-function setEnvVars(path: string, vars: EnvVar[]): number {
+function setEnvVars(path: string, vars: EnvVar[], expectedModifiedMs: number | null = null): number {
   ensureWithin(path, true);
+  if (expectedModifiedMs !== null && getFile(path).modifiedMs !== expectedModifiedMs) {
+    throw `STALE: ${path} changed on disk since it was loaded. Reload it first.`;
+  }
   const bad = vars.find((v) => !KEY_RE.test(v.key));
   if (bad) throw `"${bad.key}" isn't a valid variable name`;
   if (!isDotenvName(basename(path))) throw `${path} isn't a dotenv file`;
@@ -396,36 +411,26 @@ function githubRemote(path: string, remote: string): GithubRemote {
 
 const github: GithubState = {
   repo: "",
+  login: "octocat",
   environments: ["production", "staging"],
   repoNames: { secrets: ["CMS_TOKEN"], variables: [] },
   envNames: { production: { secrets: [], variables: ["PREVIEW"] }, staging: { secrets: [], variables: [] } },
   warnings: [],
 };
 
-/** Mock sign-in (github_auth.rs): in memory, like the real token. */
-const githubAuth = {
-  login: null as string | null,
-  pending: null as number | null,
-  generation: 0,
-  approveAfterMs: 2000,
-};
-
-const githubAccount = (): GithubAccount => ({ configured: true, login: githubAuth.login });
-
-function requireSignIn() {
-  if (!githubAuth.login) throw "GH_AUTH: Sign in to GitHub to continue.";
-}
-
-/** The mock EnvDeck GitHub App is installed on `acme/*` only, so the `fork` remote shows the install prompt. */
-function requireInstalled(r: GithubRemote) {
+/**
+ * Mock `gh auth login`: signed in for `acme/*` only, so the `fork` remote shows the
+ * "GitHub CLI isn't signed in" screen.
+ */
+function requireGhLogin(r: GithubRemote) {
   if (r.owner !== "acme") {
-    throw `GH_NOT_INSTALLED: EnvDeck isn't installed on ${r.owner}/${r.name}. Install the EnvDeck GitHub App on it (or ask an owner to), then try again.`;
+    throw "GH_AUTH: The GitHub CLI isn't signed in to GitHub. Run gh auth login in a terminal, then try again.";
   }
 }
 
 function githubPush(path: string, remote: string, items: GithubPushItem[]): GithubPushResult[] {
   const r = githubRemote(path, remote);
-  requireInstalled(r);
+  requireGhLogin(r);
   const vars = new Map(effectiveVars(parseEnv(getFile(path).text)).map((v) => [v.key, v.value]));
   return items.map((item) => {
     const value = vars.get(item.key);
@@ -434,7 +439,7 @@ function githubPush(path: string, remote: string, items: GithubPushItem[]): Gith
       error = `"${item.key}" isn't a valid GitHub name`;
     } else if (value === undefined) error = `${item.key} isn't in the file any more`;
     else if (value === "") error = "GitHub doesn't accept empty values";
-    else if (item.key === "FAIL_ME") error = "HTTP 403: Resource not accessible by integration";
+    else if (item.key === "FAIL_ME") error = "GitHub refused: you need write access to the repository (admin for some lists), and gh's token needs the repo scope (gh auth refresh -s repo). (HTTP 403: Resource not accessible by personal access token)";
     else if (item.environment !== null && !github.environments.includes(item.environment)) {
       error = `The ${item.environment} environment doesn't exist on GitHub. Create it in the repository's settings first.`;
     } else {
@@ -447,6 +452,215 @@ function githubPush(path: string, remote: string, items: GithubPushItem[]): Gith
     console.info(`[mock] gh ${item.kind} set ${item.key} --repo ${r.owner}/${r.name}${env}`);
     return { ...item, error };
   });
+}
+
+// --- Azure App Service (mirrors azure.rs; nothing leaves the browser) --------------------------
+
+const DEV_SUB = "0b1f6471-1bf0-4dda-aec3-111122223333";
+const PROD_SUB = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+const siteOf = (sub: string, rg: string, name: string, kind: string): AzureSite => ({
+  id: `/subscriptions/${sub}/resourceGroups/${rg}/providers/Microsoft.Web/sites/${name}`,
+  name,
+  resourceGroup: rg,
+  kind,
+  location: "westeurope",
+});
+
+const azureSites: Record<string, AzureSite[]> = {
+  [DEV_SUB]: [
+    siteOf(DEV_SUB, "shop-rg", "shop-api", "app,linux"),
+    siteOf(DEV_SUB, "shop-rg", "shop-web", "app"),
+    siteOf(DEV_SUB, "jobs-rg", "shop-jobs", "functionapp,linux"),
+  ],
+  [PROD_SUB]: [siteOf(PROD_SUB, "shop-prod-rg", "shop-api-prod", "app,linux")],
+};
+const azureSlots: Record<string, string[]> = { "shop-api": ["staging"], "shop-api-prod": ["staging", "canary"] };
+
+/** Existing names per app or slot (`id` or `id/slots/x`), and slot settings per app. */
+type NameSets = { app: Set<string>; conn: Set<string> };
+const azureNames = new Map<string, NameSets>();
+const azureSticky = new Map<string, NameSets>();
+function namesFor(map: Map<string, NameSets>, key: string): NameSets {
+  if (!map.has(key)) map.set(key, { app: new Set(), conn: new Set() });
+  return map.get(key)!;
+}
+namesFor(azureNames, azureSites[DEV_SUB][0].id).app.add("PORT");
+namesFor(azureNames, azureSites[DEV_SUB][0].id).conn.add("DATABASE_URL");
+
+const listedSites = new Set<string>();
+let azureSignedIn = true;
+
+const AZ_AUTH =
+  "AZ_AUTH: The Azure CLI isn't signed in, or its sign-in expired. Run az login in a terminal, then try again.";
+const REDEPLOYS = "Changing the source starts a deployment";
+
+function mockField(
+  id: string,
+  label: string,
+  section: AzureField["section"],
+  kind: AzureField["kind"],
+  target: string,
+  extra: Partial<AzureField> = {},
+): AzureField {
+  return { id, label, section, kind, choices: [], secret: false, appSetting: null, target, note: null, ...extra };
+}
+
+/** Mirrors `azure::FIELDS`. */
+const AZURE_FIELDS: AzureField[] = [
+  mockField("startupCommand", "Startup command", "general", "text", "web:appCommandLine"),
+  mockField("runtimeStack", "Runtime stack (Linux, e.g. NODE|20-lts)", "general", "text", "web:linuxFxVersion"),
+  mockField("alwaysOn", "Always on", "general", "bool", "web:alwaysOn"),
+  mockField("http20Enabled", "HTTP 2.0", "general", "bool", "web:http20Enabled"),
+  mockField("webSocketsEnabled", "Web sockets", "general", "bool", "web:webSocketsEnabled"),
+  mockField("use32BitWorkerProcess", "32-bit worker process", "general", "bool", "web:use32BitWorkerProcess"),
+  mockField("minTlsVersion", "Minimum TLS version", "general", "choice", "web:minTlsVersion", {
+    choices: ["1.0", "1.1", "1.2", "1.3"],
+  }),
+  mockField("ftpsState", "FTP state", "general", "choice", "web:ftpsState", {
+    choices: ["AllAllowed", "FtpsOnly", "Disabled"],
+  }),
+  mockField("healthCheckPath", "Health check path", "general", "path", "web:healthCheckPath"),
+  mockField("numberOfWorkers", "Number of workers", "general", "count", "web:numberOfWorkers"),
+  mockField("containerImage", "Container image (Linux)", "deployment", "text", "web:linuxFxVersion"),
+  mockField("registryUrl", "Registry server URL", "deployment", "text", "app:docker_registry_server_url", {
+    appSetting: "DOCKER_REGISTRY_SERVER_URL",
+  }),
+  mockField("registryUsername", "Registry username", "deployment", "text", "app:docker_registry_server_username", {
+    appSetting: "DOCKER_REGISTRY_SERVER_USERNAME",
+  }),
+  mockField("registryPassword", "Registry password", "deployment", "text", "app:docker_registry_server_password", {
+    appSetting: "DOCKER_REGISTRY_SERVER_PASSWORD",
+    secret: true,
+  }),
+  mockField("repoUrl", "Source repository URL", "deployment", "text", "src:repoUrl", { note: REDEPLOYS }),
+  mockField("branch", "Source branch", "deployment", "text", "src:branch", { note: REDEPLOYS }),
+];
+const CONNECTION_TYPES = [
+  "Custom",
+  "SQLAzure",
+  "SQLServer",
+  "MySql",
+  "PostgreSQL",
+  "RedisCache",
+  "DocDb",
+  "EventHub",
+  "ServiceBus",
+  "NotificationHub",
+  "ApiHub",
+];
+
+function requireAzLogin() {
+  if (!azureSignedIn) throw AZ_AUTH;
+}
+
+/** Mirrors `commands::azure_site`: only apps listed this session. */
+function azureSite(siteId: string, slot: string | null = null): AzureSite {
+  requireAzLogin();
+  const site = Object.values(azureSites)
+    .flat()
+    .find((s) => s.id.toLowerCase() === siteId.toLowerCase());
+  if (!site || !listedSites.has(site.id)) throw "Pick the app again: EnvDeck only uses apps the Azure CLI listed";
+  if (slot !== null && !/^[A-Za-z0-9-]{1,59}$/.test(slot)) throw `"${slot}" isn't a deployment slot name`;
+  return site;
+}
+
+const slotKey = (site: AzureSite, slot: string | null) => (slot ? `${site.id}/slots/${slot}` : site.id);
+
+function azureInspect(siteId: string, slot: string | null): AzureState {
+  const site = azureSite(siteId, slot);
+  const names = namesFor(azureNames, slotKey(site, slot));
+  const sticky = namesFor(azureSticky, site.id);
+  return structuredClone({
+    site: site.name,
+    slot,
+    linux: site.kind.includes("linux"),
+    appSettings: [...names.app].sort(),
+    connectionStrings: [...names.conn].sort(),
+    stickyAppSettings: [...sticky.app],
+    stickyConnectionStrings: [...sticky.conn],
+    fields: AZURE_FIELDS,
+    connectionTypes: CONNECTION_TYPES,
+    warnings: [],
+  });
+}
+
+function azurePush(path: string, siteId: string, slot: string | null, items: AzurePushItem[]): AzurePushResult[] {
+  ensureWithin(path);
+  if (!isDotenvName(basename(path))) throw `${path} isn't a dotenv file`;
+  const site = azureSite(siteId, slot);
+  const vars = new Map(effectiveVars(parseEnv(getFile(path).text)).map((v) => [v.key, v.value]));
+  const names = namesFor(azureNames, slotKey(site, slot));
+  const sticky = namesFor(azureSticky, site.id);
+  const taken = new Set<string>();
+  return items.map((item) => {
+    const value = vars.get(item.key);
+    const name = item.name ?? item.key;
+    const field = AZURE_FIELDS.find((f) => f.id === item.field);
+    let error: string | null = null;
+    let target = "";
+    if (value === undefined) error = `${item.key} isn't in the file any more`;
+    else if (item.dest === "field") {
+      error = field ? fieldValueProblem(field, value) : `"${item.field}" isn't a setting EnvDeck can set`;
+      target = field?.target ?? "";
+      if (!error && field?.id === "containerImage" && !site.kind.includes("linux")) {
+        error = "Container images can only be set here for Linux apps";
+      }
+    } else if (!isValidSettingName(name)) error = `"${name}" isn't a valid name (letters, digits, _ . - :)`;
+    else if (item.dest === "connectionString" && !CONNECTION_TYPES.includes(item.connType ?? "Custom")) {
+      error = `"${item.connType}" isn't a connection string type`;
+    } else target = `${item.dest === "appSetting" ? "app" : "conn"}:${name.toLowerCase()}`;
+    if (!error && taken.has(target)) error = "Another row already sets this";
+    if (!error && item.key === "FAIL_ME") {
+      error =
+        "Azure refused: your account needs write access to the app (for example the Website Contributor role). ((AuthorizationFailed))";
+    }
+    if (!error) {
+      taken.add(target);
+      if (item.dest === "appSetting") names.app.add(name);
+      if (item.dest === "connectionString") names.conn.add(name);
+      if (field?.appSetting) names.app.add(field.appSetting);
+      if (item.slotSetting && item.dest !== "field") (item.dest === "appSetting" ? sticky.app : sticky.conn).add(name);
+    }
+    // Key names only; never values.
+    console.info(`[mock] az rest: ${item.dest} ${item.field ?? name} on ${site.name}${slot ? `/${slot}` : ""}`);
+    return { key: item.key, error };
+  });
+}
+
+function azureHint(path: string) {
+  ensureWithin(path);
+  if (!isDotenvName(basename(path))) throw `${path} isn't a dotenv file`;
+  const config = files.get(join(dirname(path), ".azure/config"))?.text ?? "";
+  const value = (k: string) =>
+    config
+      .split("\n")
+      .map((l) => l.split("="))
+      .find(([key]) => key.trim() === k)?.[1]
+      ?.trim() || null;
+  return value("web") ? { group: value("group"), web: value("web") } : null;
+}
+
+// --- updates (update.rs) ----------------------------------------------------------------------
+
+const MOCK_UPDATE: UpdateInfo = {
+  version: "0.2.0",
+  currentVersion: "0.1.0",
+  notes: "- Faster scans of large folders\n- Push to Azure App Service slots",
+  date: "2026-10-01T09:00:00Z",
+};
+/** Whether the next check finds MOCK_UPDATE; `__envdeckMock.updateAvailable(false)` says "up to date". */
+let updateAvailable = true;
+let checkedUpdate: UpdateInfo | null = null;
+
+async function installUpdate() {
+  if (!checkedUpdate) throw "NO_UPDATE: Check for updates first";
+  const total = 12_582_912;
+  for (let downloaded = 0; downloaded <= total; downloaded += total / 8) {
+    await emit("update-progress", { downloaded, total });
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  console.info(`[mock] install ${checkedUpdate.version} and restart (native only)`);
 }
 
 type Args = Record<string, unknown>;
@@ -494,7 +708,8 @@ const handlers: Record<string, (a: Args) => unknown> = {
     put(path, a.content as string);
     return getFile(path).modifiedMs;
   },
-  set_env_vars: (a) => setEnvVars(a.path as string, a.vars as EnvVar[]),
+  set_env_vars: (a) =>
+    setEnvVars(a.path as string, a.vars as EnvVar[], (a.expectedModifiedMs as number | null) ?? null),
   pick_destination: () => {
     if (!state.grants.includes(PICKED_DESTINATION)) state.grants.push(PICKED_DESTINATION);
     return PICKED_DESTINATION;
@@ -515,47 +730,56 @@ const handlers: Record<string, (a: Args) => unknown> = {
   github_repo: (a) => ({ remotes: githubRemotes(a.path as string) }),
   github_inspect: (a) => {
     const r = githubRemote(a.path as string, a.remote as string);
-    requireSignIn();
-    requireInstalled(r);
+    requireGhLogin(r);
     return structuredClone({ ...github, repo: `${r.owner}/${r.name}` });
   },
-  github_push: (a) => {
-    requireSignIn();
-    return githubPush(a.path as string, a.remote as string, a.items as GithubPushItem[]);
-  },
-  github_account: () => githubAccount(),
-  github_sign_in_start: () => {
-    githubAuth.generation += 1;
-    githubAuth.pending = githubAuth.generation;
-    console.info("[mock] open https://github.com/login/device (native only)");
-    return { userCode: "WDJB-MJHT", verificationUri: "https://github.com/login/device", expiresIn: 900 };
-  },
-  github_sign_in_wait: async () => {
-    const flow = githubAuth.pending;
-    if (flow === null) throw "GH_AUTH: No sign-in in progress.";
-    // Pretend the user approves the code on GitHub after a moment.
-    await new Promise((r) => setTimeout(r, githubAuth.approveAfterMs));
-    if (githubAuth.generation !== flow) throw "GH_AUTH: Sign-in cancelled.";
-    githubAuth.pending = null;
-    githubAuth.login = "octocat";
-    return githubAccount();
-  },
-  github_open_verification: () => console.info("[mock] open https://github.com/login/device (native only)"),
+  github_push: (a) => githubPush(a.path as string, a.remote as string, a.items as GithubPushItem[]),
   github_open_page: (a) => {
     const r = githubRemote(a.path as string, a.remote as string);
-    const url =
-      a.page === "install"
-        ? "https://github.com/apps/envdeck/installations/new"
-        : `https://github.com/${r.owner}/${r.name}/settings/environments`;
-    console.info(`[mock] open ${url} (native only)`);
-  },
-  github_sign_out: () => {
-    githubAuth.login = null;
-    githubAuth.pending = null;
-    githubAuth.generation += 1;
-    return githubAccount();
+    if (a.page !== "environments") throw `Unknown GitHub page "${String(a.page)}"`;
+    console.info(`[mock] open https://github.com/${r.owner}/${r.name}/settings/environments (native only)`);
   },
   start_drag: (a) => console.info("[mock] drag-out (native only):", ensureWithin(a.path as string)),
+  azure_hint: (a) => azureHint(a.path as string),
+  azure_account: (): AzureAccount => {
+    requireAzLogin();
+    return {
+      user: "dev@contoso.com",
+      subscriptions: [
+        { id: DEV_SUB, name: "Contoso Dev", isDefault: true },
+        { id: PROD_SUB, name: "Contoso Production", isDefault: false },
+      ],
+    };
+  },
+  azure_list_apps: (a) => {
+    requireAzLogin();
+    const sites = azureSites[a.subscription as string];
+    if (!sites) throw `"${String(a.subscription)}" isn't a subscription id`;
+    sites.forEach((s) => listedSites.add(s.id));
+    return structuredClone(sites);
+  },
+  azure_list_slots: (a) => [...(azureSlots[azureSite(a.siteId as string).name] ?? [])],
+  azure_inspect: (a) => azureInspect(a.siteId as string, (a.slot as string | null) ?? null),
+  azure_push: (a) =>
+    azurePush(a.path as string, a.siteId as string, (a.slot as string | null) ?? null, a.items as AzurePushItem[]),
+  azure_open_portal: (a) => {
+    const slot = (a.slot as string | null) ?? null;
+    const site = azureSite(a.siteId as string, slot);
+    const blades: Record<string, string> = {
+      environment: "environmentVariablesAppSettings",
+      configuration: "configuration",
+      deploymentCenter: "vstscd",
+    };
+    const blade = blades[a.page as string];
+    if (!blade) throw `Unknown Azure portal page "${String(a.page)}"`;
+    console.info(`[mock] open https://portal.azure.com/#resource${slotKey(site, slot)}/${blade} (native only)`);
+  },
+
+  check_update: () => {
+    checkedUpdate = updateAvailable ? structuredClone(MOCK_UPDATE) : null;
+    return checkedUpdate;
+  },
+  install_update: () => installUpdate(),
 
   // Plugin commands the UI calls directly.
   "plugin:clipboard-manager|write_text": (a) => {
@@ -577,10 +801,6 @@ mockIPC(
 // Simulate an edit by another program (the watcher in watch.rs) from the devtools console:
 //   __envdeckMock.touch("/Users/dev/code/shop/apps/web/.env", "A=1\n")
 (window as unknown as { __envdeckMock: unknown }).__envdeckMock = {
-  /** Tests: how long the mock "user" takes to approve a GitHub sign-in. */
-  githubApproveAfter: (ms: number) => {
-    githubAuth.approveAfterMs = ms;
-  },
   touch: (path: string, text: string) => {
     put(path, text);
     return emit("configs-changed", { paths: [path] });
@@ -588,6 +808,14 @@ mockIPC(
   remove: (path: string) => {
     files.delete(path);
     return emit("configs-changed", { paths: [path] });
+  },
+  /** Simulate `az login` / `az logout`:  __envdeckMock.azureSignedIn(false) */
+  azureSignedIn: (signedIn: boolean) => {
+    azureSignedIn = signedIn;
+  },
+  /** Whether the next update check finds 0.2.0:  __envdeckMock.updateAvailable(false) */
+  updateAvailable: (available: boolean) => {
+    updateAvailable = available;
   },
 };
 

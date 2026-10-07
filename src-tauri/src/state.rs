@@ -1,10 +1,11 @@
 //! In-memory session state and the scope guard.
 //!
-//! Nothing here is persisted: session folders, destination grants and the GitHub sign-in are
-//! forgotten on quit.
+//! Nothing here is persisted: session folders and destination grants are forgotten on
+//! quit.
 //! Commands copy what they need out of the lock (`read_scopes`, `write_scopes`, ...) and never
 //! hold it across `.await` or a blocking dialog.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -40,8 +41,9 @@ pub struct Inner {
     pub dest_grants: Vec<PathBuf>,
     /// File watchers for the current roots; replaced by `watch::restart`.
     pub watcher: Option<crate::watch::WatchHandle>,
-    /// GitHub sign-in for this session (token in memory only; redacted in `Debug`).
-    pub github: crate::github_auth::Session,
+    /// App Service resource ids (lowercase) that `az` listed this session. Push to Azure only
+    /// targets these, so the page can't name an arbitrary resource.
+    pub azure_sites: HashSet<String>,
 }
 
 /// A root to scan, as the scanner needs it.

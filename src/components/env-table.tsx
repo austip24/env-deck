@@ -1,5 +1,5 @@
-import { useMemo, useRef, type Dispatch, type SetStateAction } from "react";
-import { Eye, EyeOff, TriangleAlert } from "lucide-react";
+import { useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type SetStateAction } from "react";
+import { Eye, EyeOff, Loader2, TriangleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -10,9 +10,12 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Textarea } from "@/components/ui/textarea";
 import { isSecret, MASK, overriddenLines, quoteDotenv } from "@/lib/env";
 import type { EnvLine, ParsedEnv } from "@/lib/ipc";
+import { isMac, isModKey } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 type Row =
@@ -36,6 +39,7 @@ export function EnvTable({
   selected,
   onSelectedChange,
   onCopy,
+  onEditValue,
 }: {
   env: ParsedEnv;
   /** Copies text to the clipboard; `what` names it in the toast. */
@@ -44,6 +48,8 @@ export function EnvTable({
   onToggleReveal: (line: number) => void;
   selected: Set<string>;
   onSelectedChange: Dispatch<SetStateAction<Set<string>>>;
+  /** Saves a new value for a key (double-click a value); resolves false if it wasn't saved. */
+  onEditValue?: (key: string, value: string) => Promise<boolean>;
 }) {
   const rows = useMemo<Row[]>(() => {
     const overridden = overriddenLines(env);
@@ -90,7 +96,7 @@ export function EnvTable({
     <Table className="table-fixed">
       <TableHeader className="sticky top-0 z-10 bg-background">
         <TableRow>
-          <TableHead className="w-10">
+          <TableHead className="w-10 [&>[role=checkbox]]:translate-y-0">
             <Checkbox
               aria-label="Select all variables"
               checked={allSelected ? true : someSelected ? "indeterminate" : false}
@@ -126,6 +132,8 @@ export function EnvTable({
               checked={!row.overridden && selected.has(row.line.key)}
               onCheck={(shift) => toggleKey(row.line.key, shift)}
               onCopy={onCopy}
+              // The overridden (earlier) definition isn't the one an upsert writes.
+              onEdit={onEditValue && !row.overridden ? (value) => onEditValue(row.line.key, value) : undefined}
             />
           ),
         )}
@@ -141,6 +149,7 @@ function PairRow({
   checked,
   onCheck,
   onCopy,
+  onEdit,
 }: {
   row: Extract<Row, { kind: "pair" }>;
   revealed: boolean;
@@ -148,14 +157,57 @@ function PairRow({
   checked: boolean;
   onCheck: (shift: boolean) => void;
   onCopy: (text: string, what: string) => void;
+  onEdit?: (value: string) => Promise<boolean>;
 }) {
   const { line, overridden, secret } = row;
   const masked = secret && !revealed;
+  // The value being edited, or null. Editing shows the raw value, even for a masked secret:
+  // double-clicking is the explicit action, and it's masked again once saved or cancelled.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  // Enter/Escape then blur would finish twice; only the first counts.
+  const finished = useRef(false);
+  const multiline = draft !== null && (draft.includes("\n") || line.value.includes("\n"));
+
+  // Choosing "Edit value" in the context menu mustn't hand focus back to the row.
+  const editFromMenu = useRef(false);
+
+  const startEdit = () => {
+    if (!onEdit || draft !== null) return;
+    finished.current = false;
+    setDraft(line.value);
+  };
+
+  const finish = async (save: boolean) => {
+    if (finished.current || draft === null) return;
+    finished.current = true;
+    if (!save || draft === line.value) {
+      setDraft(null);
+      return;
+    }
+    setSaving(true);
+    const ok = await onEdit!(draft);
+    setSaving(false);
+    // On failure (e.g. the file changed on disk) keep the draft; Escape discards it.
+    if (ok) setDraft(null);
+    else finished.current = false;
+  };
+
+  const onEditorKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      void finish(false);
+    } else if (e.key === "Enter" && (multiline ? isModKey(e) : !e.shiftKey)) {
+      e.preventDefault();
+      void finish(true);
+    }
+  };
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <TableRow data-state={checked ? "selected" : undefined} className={cn(overridden && "opacity-55")}>
-          <TableCell>
+          <TableCell className="[&>[role=checkbox]]:translate-y-0">
             {!overridden && (
               <Checkbox
                 aria-label={`Select ${line.key}`}
@@ -167,7 +219,7 @@ function PairRow({
               />
             )}
           </TableCell>
-          <TableCell className="align-top">
+          <TableCell>
             <div className="flex min-w-0 items-center gap-1.5">
               <span className="selectable truncate font-mono text-[13px]" title={line.key}>
                 {line.key}
@@ -184,41 +236,97 @@ function PairRow({
               )}
             </div>
           </TableCell>
-          <TableCell className="align-top whitespace-normal">
-            <div className="flex min-w-0 items-start gap-1">
-              <div className="min-w-0 flex-1 font-mono text-[13px]">
-                {line.value === "" ? (
-                  <span className="text-muted-foreground italic">empty</span>
-                ) : masked ? (
-                  <span className="text-muted-foreground tracking-widest" aria-label="Hidden value">
-                    {MASK}
-                  </span>
+          <TableCell className="whitespace-normal" onDoubleClick={startEdit}>
+            {draft !== null ? (
+              <div className="flex flex-col gap-1">
+                {multiline ? (
+                  <Textarea
+                    autoFocus
+                    aria-label={`Value of ${line.key}`}
+                    value={draft}
+                    disabled={saving}
+                    rows={Math.min(8, draft.split("\n").length + 1)}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={onEditorKey}
+                    onBlur={() => void finish(true)}
+                    className="selectable min-h-0 font-mono text-[13px]"
+                  />
                 ) : (
-                  <span className="selectable line-clamp-4 break-all whitespace-pre-wrap">{line.value}</span>
+                  <Input
+                    autoFocus
+                    aria-label={`Value of ${line.key}`}
+                    value={draft}
+                    disabled={saving}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={onEditorKey}
+                    onBlur={() => void finish(true)}
+                    onFocus={(e) => e.target.select()}
+                    className="selectable h-7 font-mono text-[13px]"
+                  />
                 )}
-                {line.inlineComment && (
-                  <span className="selectable ml-2 text-xs text-muted-foreground">{line.inlineComment}</span>
+                <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                  {saving && <Loader2 className="size-3 animate-spin" />}
+                  {multiline ? (isMac ? "⌘Enter" : "Ctrl+Enter") : "Enter"} to save · Esc to cancel
+                </span>
+              </div>
+            ) : (
+              <div
+                className={cn("flex min-w-0 items-center gap-1", onEdit && "cursor-text")}
+                title={onEdit ? "Double-click to edit" : undefined}
+              >
+                <div className="min-w-0 flex-1 font-mono text-[13px]">
+                  {line.value === "" ? (
+                    <span className="text-muted-foreground italic">empty</span>
+                  ) : masked ? (
+                    <span className="text-muted-foreground tracking-widest" aria-label="Hidden value">
+                      {MASK}
+                    </span>
+                  ) : (
+                    <span className="selectable line-clamp-4 break-all whitespace-pre-wrap">{line.value}</span>
+                  )}
+                  {line.inlineComment && (
+                    <span className="selectable ml-2 text-xs text-muted-foreground">{line.inlineComment}</span>
+                  )}
+                </div>
+                {secret && (
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    onClick={onToggleReveal}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                    aria-label={revealed ? `Hide ${line.key}` : `Reveal ${line.key}`}
+                    className="text-muted-foreground"
+                  >
+                    {revealed ? <EyeOff /> : <Eye />}
+                  </Button>
                 )}
               </div>
-              {secret && (
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={onToggleReveal}
-                  aria-label={revealed ? `Hide ${line.key}` : `Reveal ${line.key}`}
-                  className="text-muted-foreground"
-                >
-                  {revealed ? <EyeOff /> : <Eye />}
-                </Button>
-              )}
-            </div>
+            )}
           </TableCell>
-          <TableCell className="text-right align-top text-xs text-muted-foreground tabular-nums">
+          <TableCell className="text-right text-xs text-muted-foreground tabular-nums">
             {line.startLine}
           </TableCell>
         </TableRow>
       </ContextMenuTrigger>
-      <ContextMenuContent>
+      <ContextMenuContent
+        onCloseAutoFocus={(e) => {
+          if (editFromMenu.current) e.preventDefault();
+          editFromMenu.current = false;
+        }}
+      >
+        {onEdit && (
+          <>
+            <ContextMenuItem
+              onSelect={() => {
+                editFromMenu.current = true;
+                startEdit();
+              }}
+            >
+              Edit value
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+          </>
+        )}
         <ContextMenuItem onSelect={() => onCopy(line.value, `value of ${line.key}`)}>Copy value</ContextMenuItem>
         <ContextMenuItem onSelect={() => onCopy(line.key, "key")}>Copy key</ContextMenuItem>
         <ContextMenuItem onSelect={() => onCopy(`${line.key}=${quoteDotenv(line.value)}`, `${line.key}=…`)}>

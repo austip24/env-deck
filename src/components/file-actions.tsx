@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { ClipboardCopy, Copy, Ellipsis, ExternalLink, GitBranch, GripVertical, Pencil } from "lucide-react";
+import { ClipboardCopy, Cloud, Copy, Ellipsis, ExternalLink, GitBranch, GripVertical, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -34,6 +34,7 @@ export function FileActions({
   onPushToGithub,
   githubRepo,
   githubUnavailable,
+  onPushToAzure,
 }: {
   content: ConfigContent;
   file: ConfigFile | undefined;
@@ -50,6 +51,7 @@ export function FileActions({
   githubRepo: GithubRepoInfo | null;
   /** Why "Push to GitHub" isn't available (e.g. no .git next to the file). */
   githubUnavailable: string | null;
+  onPushToAzure: () => void;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -127,6 +129,9 @@ export function FileActions({
                 Push to GitHub secrets/variables…
               </DropdownMenuItem>
             )}
+            <DropdownMenuItem onSelect={onPushToAzure} disabled={vars.length === 0}>
+              Push to Azure App Service…
+            </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
       )}
@@ -152,6 +157,20 @@ export function FileActions({
               : githubUnavailable
                 ? `Push to GitHub needs a .git folder next to this file. ${githubUnavailable}`
                 : "Looking for a GitHub repository next to this file…"}
+          </TooltipContent>
+        </Tooltip>
+      )}
+
+      {vars && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button variant="outline" size="sm" onClick={onPushToAzure} disabled={vars.length === 0 || editing}>
+              <Cloud /> Azure
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-72">
+            Push {selectedCount > 0 ? "selected" : "all"} keys to an Azure App Service as app settings, connection
+            strings or configuration
           </TooltipContent>
         </Tooltip>
       )}

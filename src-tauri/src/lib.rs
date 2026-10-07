@@ -1,12 +1,14 @@
+mod azure;
+mod cli;
 mod commands;
 mod envfile;
 mod error;
 mod fsops;
 mod github;
-mod github_auth;
 mod manifest;
 mod scan;
 mod state;
+mod update;
 mod watch;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -15,8 +17,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             commands::init_state(app.handle());
+            update::init(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -40,12 +44,16 @@ pub fn run() {
             commands::github_repo,
             commands::github_inspect,
             commands::github_push,
-            commands::github_account,
-            commands::github_sign_in_start,
-            commands::github_sign_in_wait,
-            commands::github_open_verification,
-            commands::github_sign_out,
             commands::github_open_page,
+            commands::azure_hint,
+            commands::azure_account,
+            commands::azure_list_apps,
+            commands::azure_list_slots,
+            commands::azure_inspect,
+            commands::azure_push,
+            commands::azure_open_portal,
+            commands::check_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

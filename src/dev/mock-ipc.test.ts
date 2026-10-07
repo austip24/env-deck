@@ -1,7 +1,7 @@
 // Drives the typed wrappers in lib/ipc.ts against the dev:mock backend, so argument names and
 // result shapes stay in step between the two.
 import { beforeAll, describe, expect, it } from "vitest";
-import { errorCode, ipc, onConfigsChanged } from "@/lib/ipc";
+import { errorCode, errorText, ipc, onConfigsChanged, onUpdateProgress, type UpdateProgress } from "@/lib/ipc";
 
 beforeAll(async () => {
   // mockIPC installs itself on `window`; give Node one.
@@ -33,6 +33,14 @@ describe("mock IPC through lib/ipc.ts", () => {
     );
     await ipc.setEnvVars(api.path, [{ key: "PORT", value: "5000" }]);
     expect((await ipc.readConfig(api.path)).text).toContain("PORT=5000\r\n");
+
+    // A value edited in the table carries the mtime it was loaded with.
+    const loaded = await ipc.readConfig(api.path);
+    await expect(
+      ipc.setEnvVars(api.path, [{ key: "PORT", value: "6000" }], loaded.modifiedMs - 1),
+    ).rejects.toSatisfy((e) => errorCode(e) === "STALE");
+    await ipc.setEnvVars(api.path, [{ key: "PORT", value: "6000" }], loaded.modifiedMs);
+    expect((await ipc.readConfig(api.path)).text).toContain("PORT=6000\r\n");
   });
 
   it("copies with conflict policies and refuses out-of-scope paths", async () => {
@@ -87,28 +95,17 @@ describe("mock IPC through lib/ipc.ts", () => {
       (e) => errorCode(e) === "NO_REPO",
     );
 
-    // Signed out: inspect asks for sign-in.
-    expect(await ipc.githubAccount()).toEqual({ configured: true, login: null });
-    await expect(ipc.githubInspect(path, "origin")).rejects.toSatisfy((e) => errorCode(e) === "GH_AUTH");
+    // gh isn't signed in for the fork's owner: inspect and push say how to sign in.
+    const ghAuth = (e: unknown) => errorCode(e) === "GH_AUTH" && errorText(e).includes("gh auth login");
+    await expect(ipc.githubInspect(path, "fork")).rejects.toSatisfy(ghAuth);
+    await expect(
+      ipc.githubPush(path, "fork", [{ key: "CMS_TOKEN", kind: "secret", environment: null }]),
+    ).rejects.toSatisfy(ghAuth);
 
-    const mock = (globalThis as unknown as { __envdeckMock: { githubApproveAfter: (ms: number) => void } })
-      .__envdeckMock;
-    mock.githubApproveAfter(1);
-    // Cancelling (sign-out) stops a pending sign-in.
-    await ipc.githubSignInStart();
-    const cancelled = ipc.githubSignInWait();
-    await ipc.githubSignOut();
-    await expect(cancelled).rejects.toSatisfy((e) => errorCode(e) === "GH_AUTH");
-
-    const device = await ipc.githubSignInStart();
-    expect(device.userCode).toMatch(/^\w{4}-\w{4}$/);
-    expect((await ipc.githubSignInWait()).login).toBe("octocat");
-
-    // The app isn't installed on the fork.
-    await expect(ipc.githubInspect(path, "fork")).rejects.toSatisfy((e) => errorCode(e) === "GH_NOT_INSTALLED");
-
+    // No EnvDeck sign-in: gh's own login is used as is.
     const state = await ipc.githubInspect(path, "origin");
     expect(state.repo).toBe("acme/blog");
+    expect(state.login).toBe("octocat");
     const results = await ipc.githubPush(path, "origin", [
       { key: "CMS_TOKEN", kind: "variable", environment: "staging" },
       { key: "CMS_TOKEN", kind: "secret", environment: "preview" },
@@ -119,6 +116,65 @@ describe("mock IPC through lib/ipc.ts", () => {
     const after = await ipc.githubInspect(path, "origin");
     expect(after.environments).not.toContain("preview");
     expect(after.envNames.staging.variables).toEqual(["CMS_TOKEN"]);
+  });
+
+  it("pushes to an Azure App Service the Azure CLI listed", async () => {
+    const path = "/Users/dev/code/shop/apps/api/.env";
+    expect(await ipc.azureHint(path)).toEqual({ group: "shop-rg", web: "shop-api" });
+    expect(await ipc.azureHint("/Users/dev/code/blog/.env.local")).toBeNull();
+
+    const account = await ipc.azureAccount();
+    expect(account.user).toBe("dev@contoso.com");
+    const sub = account.subscriptions[0];
+    expect(sub.isDefault).toBe(true);
+
+    // Only apps that were listed can be targeted.
+    const unlisted = "/subscriptions/7c9e6679-7425-40de-944b-e07fc1f90ae7/resourceGroups/shop-prod-rg/providers/Microsoft.Web/sites/shop-api-prod";
+    await expect(ipc.azureInspect(unlisted, null)).rejects.toMatch(/Pick the app again/);
+
+    const sites = await ipc.azureListApps(sub.id);
+    const api = sites.find((s) => s.name === "shop-api")!;
+    expect(await ipc.azureListSlots(api.id)).toEqual(["staging"]);
+    const before = await ipc.azureInspect(api.id, "staging");
+    expect(before.linux).toBe(true);
+    expect(before.fields.some((f) => f.id === "containerImage")).toBe(true);
+
+    const results = await ipc.azurePush(path, api.id, "staging", [
+      { key: "STRIPE_SECRET_KEY", dest: "appSetting", name: null, field: null, connType: null, slotSetting: true },
+      { key: "DATABASE_URL", dest: "connectionString", name: null, field: null, connType: "PostgreSQL", slotSetting: false },
+      { key: "PORT", dest: "field", name: null, field: "alwaysOn", connType: null, slotSetting: false },
+      { key: "MISSING", dest: "appSetting", name: null, field: null, connType: null, slotSetting: false },
+    ]);
+    expect(results.map((r) => r.error === null)).toEqual([true, true, false, false]);
+    expect(results[2].error).toMatch(/true or false/);
+    const after = await ipc.azureInspect(api.id, "staging");
+    expect(after.appSettings).toContain("STRIPE_SECRET_KEY");
+    expect(after.connectionStrings).toEqual(["DATABASE_URL"]);
+    expect(after.stickyAppSettings).toEqual(["STRIPE_SECRET_KEY"]);
+    await expect(ipc.azureOpenPortal(api.id, "staging", "deploymentCenter")).resolves.toBeUndefined();
+
+    // az signed out: every call says how to sign in.
+    const mock = (globalThis as unknown as { __envdeckMock: { azureSignedIn: (v: boolean) => void } }).__envdeckMock;
+    mock.azureSignedIn(false);
+    const azAuth = (e: unknown) => errorCode(e) === "AZ_AUTH" && errorText(e).includes("az login");
+    await expect(ipc.azureAccount()).rejects.toSatisfy(azAuth);
+    await expect(ipc.azureInspect(api.id, null)).rejects.toSatisfy(azAuth);
+    mock.azureSignedIn(true);
+  });
+
+  it("checks for and installs an update", async () => {
+    const mock = (globalThis as unknown as { __envdeckMock: { updateAvailable: (v: boolean) => void } }).__envdeckMock;
+    mock.updateAvailable(false);
+    expect(await ipc.checkUpdate()).toBeNull();
+    await expect(ipc.installUpdate()).rejects.toSatisfy((e) => errorCode(e) === "NO_UPDATE");
+
+    mock.updateAvailable(true);
+    expect(await ipc.checkUpdate()).toMatchObject({ version: "0.2.0", currentVersion: "0.1.0" });
+    const seen: UpdateProgress[] = [];
+    const unlisten = await onUpdateProgress((p) => seen.push(p));
+    await ipc.installUpdate();
+    unlisten();
+    expect(seen.at(-1)).toEqual({ downloaded: 12_582_912, total: 12_582_912 });
   });
 
   it("adds a session folder", async () => {

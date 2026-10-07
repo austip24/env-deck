@@ -10,8 +10,8 @@ doc in the same change or stop and ask.
 
 - **Shell:** Tauri 2 (Rust, stable toolchain, edition 2024)
 - **Frontend:** React 19, TypeScript (strict), Vite, Tailwind CSS v4, shadcn/ui (new-york, neutral base with the blue theme, Radix via the `radix-ui` package), `lucide-react` icons, `sonner` toasts
-- **Rust crates:** `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `drag`, `dunce`, `dirs`, `serde`, `thiserror`, `ureq` (GitHub sign-in only)
-- **Tauri plugins:** `dialog`, `opener`, `clipboard-manager`. Drag-out uses CrabNebula's `drag` crate from Rust, not its JS plugin. **Not** `fs`, `store`, `sql` or `stronghold` (`tauri-plugin-dialog` pulls in the `fs` crate internally; it is never registered and has no capability).
+- **Rust crates:** `walkdir`, `globset`, `notify-debouncer-full`, `clipboard-rs`, `drag`, `dunce`, `dirs`, `serde`, `thiserror`
+- **Tauri plugins:** `dialog`, `opener`, `clipboard-manager`, `updater` (driven from Rust only; the webview has no `updater:*` permission). Drag-out uses CrabNebula's `drag` crate from Rust, not its JS plugin. **Not** `fs`, `store`, `sql` or `stronghold` (`tauri-plugin-dialog` pulls in the `fs` crate internally; it is never registered and has no capability).
 - **Frontend tests:** Vitest
 
 ## UI
@@ -43,14 +43,18 @@ src/
   components/         app components (sidebar, file-view, env-table, source-view,
                       compare-view, copy-to-dialog, empty-state)
   components/ui/      shadcn components (copied source; edit in place)
-  hooks/              use-workspace (manifest + scan + watcher events), use-copy
+  hooks/              use-workspace (manifest + scan + watcher events), use-copy, use-update
   lib/ipc.ts          typed invoke() wrappers: the ONLY place the UI calls Rust
   lib/env.ts          secret detection, masking, compare, clipboard formats
   lib/platform.ts     OS detection, shortcut labels, editor URLs, path display
   lib/github.ts       Push to GitHub: name rules, default rows, replace status
+  lib/azure.ts        Push to Azure App Service: destinations, field checks, replace status
+  lib/cross-push.ts   after a push, offer the same keys to the other service
+  lib/update.ts       in-app update progress and labels
   dev/mock-ipc.ts     mock IPC for `dev:mock`; must never ship in the app bundle
 scripts/
   check-bundle.mjs    post-build guard: fails if mock IPC is in dist/
+  bump-version.mjs    `npm run release:version -- X.Y.Z`: sets the version in every file
 src-tauri/
   capabilities/default.json   the webview's permissions (keep minimal)
   src/commands.rs     IPC surface
@@ -60,8 +64,10 @@ src-tauri/
   src/envfile.rs      comment-preserving dotenv parser and upsert writer
   src/fsops.rs        size-capped reads, atomic writes, copy with conflict policy
   src/watch.rs        debounced recursive watcher -> `configs-changed` event
-  src/github.rs       "Push to GitHub": .git remote detection, runs `gh` with the session token
-  src/github_auth.rs  "Sign in with GitHub": GitHub App Device Flow, token in memory only
+  src/cli.rs          runs `gh` and `az` (the only place that spawns processes)
+  src/github.rs       "Push to GitHub": .git remote detection, runs `gh` with the user's own gh login
+  src/azure.rs        "Push to Azure App Service": runs `az rest` with the user's own az login
+  src/update.rs       in-app updates from GitHub Releases (tauri-plugin-updater)
 ```
 
 ## Hard rules
@@ -75,9 +81,11 @@ These are product requirements. Do not work around them.
 3. **Every path from the webview passes `state::ensure_within`.** Reads must be inside a scan root or the library. Writes may also target a folder the user picked in a native dialog this session. Folder pickers run in Rust (`pick_folder`), never in the webview, so the page can't fake a grant. A new command that takes a path without this check is a security bug. This includes native actions: reveal and drag-out are EnvDeck commands (`reveal`, `start_drag`), not webview plugin calls. `save_manifest` must never accept `roots` or `library` from the webview.
 4. **Writes are atomic and never silent.** Use `fsops::write_atomic` (temp file + rename). Copy uses an explicit `OnConflict` policy with `fail` as the default. Saving edited text passes the mtime it loaded and is refused if the file changed on disk.
 5. **dotenv edits go through `envfile::upsert`.** Only change the lines for the keys being written. Preserve comments, key order, `export` prefixes and the file's line ending (CRLF must stay CRLF). Use `quote_value` for values; prefer single quotes so `$` isn't interpolated.
-6. **Secrets stay masked by default** in every view that shows values (table, source, compare). Reveal state is in memory only. Never log file contents or values (no `println!`/`console.log` of them). EnvDeck makes no network calls except for **Push to GitHub**, and only after the user acts; don't add any others (no telemetry, no update checks without an explicit decision). For that feature:
-   - **Sign-in** (`github_auth.rs`) is the Device Flow for the **EnvDeck GitHub App**, not an OAuth App, using `ureq`, which is only used there. The app's client ID and slug are compiled in from `ENVDECK_GITHUB_CLIENT_ID` and `ENVDECK_GITHUB_APP_SLUG`, set in `src-tauri/.cargo/config.toml`. Never add a client secret or private key. Tokens carry only the app's repository permissions: Secrets, Variables and Environments (read & write), Actions (read) and Metadata (read). They reach only repositories where the app is installed, and they expire after 8 hours. Don't add permissions, and in particular not `Administration`, without an explicit decision. Tokens, including the refresh token, live in Rust memory for the session (`state.github`, redacted in `Debug`). They are refreshed there, never written to disk or the keychain, never sent to the webview, and forgotten on sign-out, on quit, or when GitHub rejects them.
-   - **Pushes** (`github.rs`, the only place that spawns processes) first check that the app is installed on the repo, then run the `gh` CLI with the token as `GH_TOKEN`. Values go to `gh` on stdin, never argv. Rust re-reads the values from disk and resolves the repo from `.git` itself. URLs EnvDeck opens (device login, app install, environment settings) are built in Rust. Nothing `gh` prints is logged.
+6. **Secrets stay masked by default** in every view that shows values (table, source, compare). Reveal state is in memory only. Never log file contents or values (no `println!`/`console.log` of them). EnvDeck makes no network calls of its own besides the update check; the others are the `gh` runs behind **Push to GitHub** and the `az` runs behind **Push to Azure App Service**, and only after the user acts; don't add any others (no telemetry, no analytics). For those features:
+   - **Authentication is the GitHub CLI's own login** (`gh auth login`, or `GH_TOKEN` in gh's environment). EnvDeck has no sign-in, no GitHub App or OAuth App, no client ID and no HTTP client. It never reads, receives, stores or passes a token. This is deliberate: an app needs an organization owner's approval before it can reach org repositories, while gh's login works on any repo the user can already change. Don't reintroduce an EnvDeck app, a token prompt or token handling without an explicit decision. Don't read gh's config or keyring, and don't run `gh auth token`.
+   - **Pushes** (`github.rs`; processes are spawned only through `cli.rs`) run `gh` with its credentials untouched. They first check the login with `gh api user`. Values go to `gh` on stdin, never argv. Rust re-reads the values from disk and resolves the repo from `.git` itself. URLs EnvDeck opens (environment settings) are built in Rust. Nothing `gh` prints is logged. EnvDeck itself makes no network requests: all of them are `gh`'s.
+   - **Updates** (`update.rs`) are the one request EnvDeck makes itself: once at launch and on **Check for updates…**, `tauri-plugin-updater` fetches `latest.json` from the newest published release of `github.com/austip24/env-deck` (fixed in `tauri.conf.json`; no identifiers or telemetry are sent), and on **Install and restart** downloads the bundle it names and verifies its signature against the public key in `tauri.conf.json`. The webview never names a URL or version and has no `updater:*` permission; the found update stays in Rust memory. Don't add other endpoints or report anything back.
+   - **Azure uses the Azure CLI's own login** (`az login`) the same way: no token prompt, never `az account get-access-token`, never read `~/.azure`. `azure.rs` checks the login with `az account show`, writes only through `az rest --body @-` (values and existing settings travel on stdin, never argv), reads, merges and writes back whole collections (app settings, connection strings, slot settings) without deleting anything, and only targets apps `az` listed this session (`AppState::azure_sites`). Destinations besides app settings and connection strings come from the fixed `azure::FIELDS` catalog; the webview never names an ARM path. Portal URLs are built in Rust.
 7. **Capabilities stay minimal.** Adding a permission to `capabilities/default.json` (or widening the `opener:allow-open-url` scope beyond editor `://file/*` URLs) needs a reason in the PR description.
 8. **Don't honour `.gitignore` when scanning.** `.env` files are usually git-ignored; that's why the app exists. Exclusions come from `excludeDirs`.
 
@@ -116,4 +124,4 @@ These are product requirements. Do not work around them.
 
 ## Out of scope unless asked
 
-Cloud sync, accounts, secret-manager integrations (Vault, 1Password, Doppler; pushing to GitHub Actions secrets/variables, with GitHub sign-in, is the one integration in scope), encryption at rest, auto-update and telemetry. Ideas the team has noted are in ARCHITECTURE.md, "Later ideas".
+Cloud sync, accounts, secret-manager integrations (Vault, 1Password, Doppler; pushing to GitHub Actions secrets/variables through the user's `gh` login and to Azure App Service configuration through the user's `az` login are the integrations in scope), encryption at rest and telemetry. Ideas the team has noted are in ARCHITECTURE.md, "Later ideas".

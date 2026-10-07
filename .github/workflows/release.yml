@@ -1,6 +1,8 @@
 name: Release
 
 # Push a tag like v0.1.0 to build installers and attach them to a draft GitHub release.
+# The release also carries signed updater bundles and latest.json; installed copies of EnvDeck
+# only see the update once the draft is published (update.rs reads releases/latest).
 on:
   push:
     tags: ["v*"]
@@ -42,7 +44,9 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The EnvDeck GitHub App's client ID and slug come from src-tauri/.cargo/config.toml.
+          # Signs the updater bundles (README, "Release"). The public key is in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # macOS signing and notarization: add these repository secrets, then uncomment.
           # Without them the .app/.dmg are unsigned and Gatekeeper will warn on first launch.
           # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -58,3 +62,6 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+          includeUpdaterJson: true
+          # Windows updates install with the NSIS installer (installMode "passive").
+          updaterJsonPreferNsis: true

@@ -1,24 +1,25 @@
 //! The IPC surface. Every path from the webview goes through `state::ensure_within` before any
-//! file access, including native actions (reveal, drag-out, file clipboard) and the GitHub push.
+//! file access, including native actions (reveal, drag-out, file clipboard) and the GitHub and
+//! Azure pushes.
 //!
 //! All commands are `async` so Tauri runs them off the main thread. None holds the state lock
 //! across an `.await` or a dialog: they copy what they need out of it first.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::azure;
 use crate::envfile::{self, LineEnding, Parsed};
 use crate::error::{Error, Result};
 use crate::fsops::{self, CopyOutcome, OnConflict};
 use crate::github;
-use crate::github_auth::{self, Poll, Token, TokenState};
 use crate::manifest::{self, Manifest, Settings, SettingsUpdate};
 use crate::scan::{self, FileKind, ScanResult};
 use crate::state::{AppState, Inner, ensure_within};
+use crate::update::{self, UpdateInfo};
 use crate::watch;
 
 // ---------------------------------------------------------------------------------------------
@@ -352,12 +353,14 @@ pub struct EnvVar {
     pub value: String,
 }
 
-/// Upserts variables into a dotenv file, keeping its comments, order and line endings.
+/// Upserts variables into a dotenv file, keeping its comments, order and line endings. With
+/// `expected_modified_ms` (an edit of the loaded file), refuses with `STALE` if it changed since.
 #[tauri::command]
 pub async fn set_env_vars(
     state: State<'_, AppState>,
     path: PathBuf,
     vars: Vec<EnvVar>,
+    expected_modified_ms: Option<u64>,
 ) -> Result<u64> {
     if let Some(bad) = vars.iter().find(|v| !envfile::is_valid_key(&v.key)) {
         return Err(Error::InvalidDotenv(format!(
@@ -367,7 +370,10 @@ pub async fn set_env_vars(
     }
     let (path, max) = writable(&state, &path)?;
     let vars: Vec<(String, String)> = vars.into_iter().map(|v| (v.key, v.value)).collect();
-    fsops::set_env_vars(&path, &vars, max)
+    match expected_modified_ms {
+        Some(expected) => fsops::set_env_vars_checked(&path, &vars, max, expected),
+        None => fsops::set_env_vars(&path, &vars, max),
+    }
 }
 
 /// Picks a destination folder in a native dialog and grants writes to it for this session.
@@ -501,8 +507,8 @@ pub async fn start_drag(
 }
 
 // ---------------------------------------------------------------------------------------------
-// GitHub: sign-in to the EnvDeck GitHub App with the Device Flow (github_auth.rs); pushes run
-// `gh` with that token (github.rs). The token never leaves Rust.
+// GitHub: pushes run the GitHub CLI with the user's own `gh auth login` (github.rs). EnvDeck
+// holds no token and needs no GitHub App, so no organization approval is involved.
 
 /// The folder holding a dotenv file, after the scope check.
 fn dotenv_dir(state: &AppState, path: &Path) -> Result<(PathBuf, PathBuf, u64)> {
@@ -527,80 +533,6 @@ fn github_remote(dir: &Path, max: u64, remote: &str) -> Result<github::Remote> {
         .ok_or_else(|| Error::NoRepo(format!("No GitHub remote named {remote}")))
 }
 
-const SIGN_IN: &str = "Sign in to GitHub to continue.";
-const EXPIRED: &str = "Your GitHub sign-in expired. Sign in again.";
-
-/// The session's token for a github.com remote (the GitHub App lives on github.com). An expired
-/// token is refreshed first (8-hour tokens; the refresh happens outside the lock).
-async fn github_token(state: &AppState, repo: &github::Remote) -> Result<Token> {
-    if repo.host != "github.com" {
-        return Err(Error::Gh(format!(
-            "Sign-in with GitHub covers github.com repositories; this remote is on {}",
-            repo.host
-        )));
-    }
-    let (token_state, generation) = {
-        let mut inner = state.lock();
-        let session = &mut inner.github;
-        match session.token_state(Instant::now()) {
-            TokenState::SignedOut if session.token.is_some() => {
-                session.sign_out();
-                return Err(Error::GhAuth(EXPIRED.into()));
-            }
-            s => (s, session.generation),
-        }
-    };
-    match token_state {
-        TokenState::Valid(token) => Ok(token),
-        TokenState::SignedOut => Err(Error::GhAuth(SIGN_IN.into())),
-        TokenState::NeedsRefresh(refresh) => {
-            let client_id = github_auth::client_id()?;
-            let poll = tauri::async_runtime::spawn_blocking(move || {
-                github_auth::refresh(client_id, &refresh)
-            })
-            .await
-            .map_err(|e| Error::Native(e.to_string()))?;
-            apply_refresh(state, generation, poll, Instant::now())
-        }
-    }
-}
-
-/// Stores a refreshed grant, unless the user signed out meanwhile. A refused refresh signs out;
-/// a network error keeps the session so the next attempt can retry.
-fn apply_refresh(
-    state: &AppState,
-    generation: u64,
-    poll: Result<Poll>,
-    now: Instant,
-) -> Result<Token> {
-    let mut inner = state.lock();
-    if inner.github.generation != generation {
-        return Err(Error::GhAuth(SIGN_IN.into()));
-    }
-    match poll? {
-        Poll::Done(grant) => {
-            let token = grant.access.clone();
-            inner.github.store(grant, now);
-            Ok(token)
-        }
-        _ => {
-            inner.github.sign_out();
-            Err(Error::GhAuth(EXPIRED.into()))
-        }
-    }
-}
-
-/// Forgets a token GitHub rejected, so the UI offers "Sign in" again.
-fn forget_rejected<T>(state: &AppState, token: &Token, result: Result<T>) -> Result<T> {
-    if let Err(Error::GhAuth(_)) = &result {
-        let mut inner = state.lock();
-        if inner.github.token.as_ref() == Some(token) {
-            inner.github.sign_out();
-        }
-    }
-    result
-}
-
 /// GitHub remotes of the repository whose `.git` sits next to the dotenv file. Reads files only.
 #[tauri::command]
 pub async fn github_repo(state: State<'_, AppState>, path: PathBuf) -> Result<github::RepoInfo> {
@@ -608,7 +540,8 @@ pub async fn github_repo(state: State<'_, AppState>, path: PathBuf) -> Result<gi
     github::detect_repo(&dir, max)
 }
 
-/// Environments and the names of existing secrets/variables (never values).
+/// Who gh is signed in as, environments and the names of existing secrets/variables (never
+/// values). `GH_AUTH` when gh has no login for the repository's host.
 #[tauri::command]
 pub async fn github_inspect(
     state: State<'_, AppState>,
@@ -617,14 +550,9 @@ pub async fn github_inspect(
 ) -> Result<github::GithubState> {
     let (_, dir, max) = dotenv_dir(&state, &path)?;
     let repo = github_remote(&dir, max, &remote)?;
-    let token = github_token(&state, &repo).await?;
-    let t = token.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        github::inspect(&github::GhCli::locate(t)?, &repo)
-    })
-    .await
-    .map_err(|e| Error::Native(e.to_string()))?;
-    forget_rejected(&state, &token, result)
+    tauri::async_runtime::spawn_blocking(move || github::inspect(&github::GhCli::locate()?, &repo))
+        .await
+        .map_err(|e| Error::Native(e.to_string()))?
 }
 
 /// Sets secrets/variables from the file's current values, which Rust reads itself: values never
@@ -638,22 +566,18 @@ pub async fn github_push(
 ) -> Result<Vec<github::PushResult>> {
     let (path, dir, max) = dotenv_dir(&state, &path)?;
     let repo = github_remote(&dir, max, &remote)?;
-    let token = github_token(&state, &repo).await?;
     let vars = envfile::parse(&fsops::read_text(&path, max)?.text).vars();
-    let t = token.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        github::push(&github::GhCli::locate(t)?, &repo, &vars, &items)
+    tauri::async_runtime::spawn_blocking(move || {
+        github::push(&github::GhCli::locate()?, &repo, &vars, &items)
     })
     .await
-    .map_err(|e| Error::Native(e.to_string()))?;
-    forget_rejected(&state, &token, result)
+    .map_err(|e| Error::Native(e.to_string()))?
 }
 
-/// A GitHub page for the repository next to the file, built in Rust: `install` (the EnvDeck
-/// GitHub App's install page) or `environments` (the repository's environment settings).
+/// A GitHub page for the repository next to the file, built in Rust: only `environments` (the
+/// repository's environment settings).
 fn github_page_url(repo: &github::Remote, page: &str) -> Result<String> {
     match page {
-        "install" => Ok(github_auth::install_url(github_auth::app_slug()?)),
         "environments" => Ok(format!(
             "https://{}/{}/{}/settings/environments",
             repo.host, repo.owner, repo.name
@@ -677,110 +601,138 @@ pub async fn github_open_page(
         .map_err(|e| Error::Native(e.to_string()))
 }
 
-/// Whether sign-in is available in this build, and who is signed in.
-#[tauri::command]
-pub async fn github_account(state: State<'_, AppState>) -> Result<github_auth::Account> {
-    Ok(github_auth::account(&state.lock().github))
-}
+// ---------------------------------------------------------------------------------------------
+// Azure App Service: pushes run the Azure CLI with the user's own `az login` (azure.rs). EnvDeck
+// holds no token.
 
-fn open_verification() -> Result<()> {
-    tauri_plugin_opener::open_url(github_auth::VERIFY_URL, None::<&str>)
-        .map_err(|e| Error::Native(e.to_string()))
-}
-
-/// Starts the Device Flow: returns the code to type and opens github.com/login/device.
-#[tauri::command]
-pub async fn github_sign_in_start(state: State<'_, AppState>) -> Result<github_auth::DeviceLogin> {
-    let client_id = github_auth::client_id()?;
-    let (login, device_code, interval) =
-        tauri::async_runtime::spawn_blocking(move || github_auth::request_device_code(client_id))
-            .await
-            .map_err(|e| Error::Native(e.to_string()))??;
-    {
-        let mut inner = state.lock();
-        let session = &mut inner.github;
-        session.generation += 1;
-        session.flow = Some(github_auth::Flow {
-            device_code,
-            interval_secs: interval,
-            expires_in_secs: login.expires_in,
-            generation: session.generation,
-        });
-    }
-    // The dialog shows the code and a button to open the page again if this fails.
-    let _ = open_verification();
-    Ok(login)
-}
-
-/// Opens github.com/login/device again (a fixed URL; nothing from the webview).
-#[tauri::command]
-pub async fn github_open_verification() -> Result<()> {
-    open_verification()
-}
-
-/// Waits until the user approves the code on GitHub, it expires, or sign-in is cancelled.
-#[tauri::command]
-pub async fn github_sign_in_wait(app: AppHandle) -> Result<github_auth::Account> {
-    tauri::async_runtime::spawn_blocking(move || wait_for_sign_in(&app.state::<AppState>()))
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tauri::async_runtime::spawn_blocking(f)
         .await
         .map_err(|e| Error::Native(e.to_string()))?
 }
 
-fn wait_for_sign_in(state: &AppState) -> Result<github_auth::Account> {
-    let client_id = github_auth::client_id()?;
-    let flow = state
-        .lock()
-        .github
-        .flow
-        .clone()
-        .ok_or_else(|| Error::GhAuth("No sign-in in progress.".into()))?;
-    let current = || state.lock().github.generation == flow.generation;
-    let fail = |msg: &str| {
-        let mut inner = state.lock();
-        if inner.github.generation == flow.generation {
-            inner.github.flow = None;
-        }
-        Error::GhAuth(msg.into())
-    };
-    let deadline = Instant::now() + Duration::from_secs(flow.expires_in_secs);
-    let mut interval = flow.interval_secs.max(1);
-    loop {
-        // Sleep in short steps so Cancel (sign-out) takes effect quickly.
-        let wake = Instant::now() + Duration::from_secs(interval);
-        while Instant::now() < wake {
-            if !current() {
-                return Err(Error::GhAuth("Sign-in cancelled.".into()));
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        if Instant::now() >= deadline {
-            return Err(fail("The sign-in code expired. Start again."));
-        }
-        match github_auth::poll_token(client_id, &flow.device_code, interval)? {
-            Poll::Pending => {}
-            Poll::SlowDown(next) => interval = next,
-            Poll::Failed(msg) => return Err(fail(&msg)),
-            Poll::Done(grant) => {
-                let login = github_auth::fetch_login(&grant.access)?;
-                let mut inner = state.lock();
-                if inner.github.generation != flow.generation {
-                    return Err(Error::GhAuth("Sign-in cancelled.".into()));
-                }
-                inner.github.store(grant, Instant::now());
-                inner.github.login = Some(login);
-                inner.github.flow = None;
-                return Ok(github_auth::account(&inner.github));
-            }
-        }
+/// Resolves an app the webview names against the ones `az` listed this session, so the page
+/// can't point `az` at an arbitrary resource, and checks the slot name.
+fn azure_site(state: &AppState, site_id: &str, slot: Option<&str>) -> Result<azure::SiteRef> {
+    let site = azure::parse_site_id(site_id)
+        .filter(|s| state.lock().azure_sites.contains(&s.session_key()))
+        .ok_or_else(|| {
+            Error::Az("Pick the app again: EnvDeck only uses apps the Azure CLI listed".into())
+        })?;
+    if let Some(slot) = slot
+        && !azure::is_slot_name(slot)
+    {
+        return Err(Error::Az(format!(
+            "\"{slot}\" isn't a deployment slot name"
+        )));
     }
+    Ok(site)
 }
 
-/// Forgets the token (memory only) and cancels a sign-in in progress.
+/// The app named in `.azure/config` beside the dotenv file (from `az webapp up`), if any.
 #[tauri::command]
-pub async fn github_sign_out(state: State<'_, AppState>) -> Result<github_auth::Account> {
-    let mut inner = state.lock();
-    inner.github.sign_out();
-    Ok(github_auth::account(&inner.github))
+pub async fn azure_hint(state: State<'_, AppState>, path: PathBuf) -> Result<Option<azure::Hint>> {
+    let (_, dir, max) = dotenv_dir(&state, &path)?;
+    Ok(azure::local_hint(&dir, max))
+}
+
+/// Who az is signed in as and its subscriptions. `AZ_AUTH` when az has no usable login.
+#[tauri::command]
+pub async fn azure_account() -> Result<azure::Account> {
+    blocking(|| azure::account(&azure::AzCli::locate()?)).await
+}
+
+/// App Services in a subscription. Remembers their ids (in memory) as push targets.
+#[tauri::command]
+pub async fn azure_list_apps(
+    state: State<'_, AppState>,
+    subscription: String,
+) -> Result<Vec<azure::Site>> {
+    let sites =
+        blocking(move || azure::list_sites(&azure::AzCli::locate()?, &subscription)).await?;
+    state.lock().azure_sites.extend(
+        sites
+            .iter()
+            .filter_map(|s| azure::parse_site_id(&s.id))
+            .map(|s| s.session_key()),
+    );
+    Ok(sites)
+}
+
+#[tauri::command]
+pub async fn azure_list_slots(state: State<'_, AppState>, site_id: String) -> Result<Vec<String>> {
+    let site = azure_site(&state, &site_id, None)?;
+    blocking(move || azure::list_slots(&azure::AzCli::locate()?, &site)).await
+}
+
+/// Names of existing app settings, connection strings and slot settings (never values), and the
+/// catalog of other settings a key can go to.
+#[tauri::command]
+pub async fn azure_inspect(
+    state: State<'_, AppState>,
+    site_id: String,
+    slot: Option<String>,
+) -> Result<azure::AzureState> {
+    let site = azure_site(&state, &site_id, slot.as_deref())?;
+    blocking(move || azure::inspect(&azure::AzCli::locate()?, &site, slot.as_deref())).await
+}
+
+/// Sets each item from the file's current values, which Rust reads itself: values never cross
+/// IPC, and only keys that are in the file can be pushed.
+#[tauri::command]
+pub async fn azure_push(
+    state: State<'_, AppState>,
+    path: PathBuf,
+    site_id: String,
+    slot: Option<String>,
+    items: Vec<azure::PushItem>,
+) -> Result<Vec<azure::PushResult>> {
+    let (path, _, max) = dotenv_dir(&state, &path)?;
+    let site = azure_site(&state, &site_id, slot.as_deref())?;
+    let vars = envfile::parse(&fsops::read_text(&path, max)?.text).vars();
+    blocking(move || {
+        azure::push(
+            &azure::AzCli::locate()?,
+            &site,
+            slot.as_deref(),
+            &vars,
+            &items,
+        )
+    })
+    .await
+}
+
+/// Opens the app's environment variables, configuration or Deployment Center in the portal.
+/// The URL is built in Rust; the webview only names the page.
+#[tauri::command]
+pub async fn azure_open_portal(
+    state: State<'_, AppState>,
+    site_id: String,
+    slot: Option<String>,
+    page: String,
+) -> Result<()> {
+    let site = azure_site(&state, &site_id, slot.as_deref())?;
+    tauri_plugin_opener::open_url(
+        azure::portal_url(&site, slot.as_deref(), &page)?,
+        None::<&str>,
+    )
+    .map_err(|e| Error::Native(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Updates
+
+/// Asks EnvDeck's GitHub Releases for a newer version (endpoint fixed in tauri.conf.json).
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>> {
+    update::check(&app).await
+}
+
+/// Installs the update the last `check_update` found, then restarts. Progress arrives as
+/// `update-progress` events.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<()> {
+    update::install(&app).await
 }
 
 /// Registers state and loads the manifest. Called from `lib.rs` setup.
@@ -893,102 +845,6 @@ mod tests {
         }
     }
 
-    fn grant(access: &str, expires_in: u64) -> github_auth::Grant {
-        github_auth::Grant {
-            access: Token::new(access),
-            expires_in: Some(expires_in),
-            refresh: Some(Token::new("ghr_refresh")),
-            refresh_expires_in: Some(15_897_600),
-        }
-    }
-
-    #[test]
-    fn github_token_needs_sign_in_and_rejected_tokens_are_forgotten() {
-        let token_for = |state: &AppState, repo: &github::Remote| {
-            tauri::async_runtime::block_on(github_token(state, repo))
-        };
-        let state = AppState::default();
-        let mut repo = shop_remote();
-        assert!(matches!(token_for(&state, &repo), Err(Error::GhAuth(_))));
-
-        let token = Token::new("ghu_test");
-        state
-            .lock()
-            .github
-            .store(grant("ghu_test", 28_800), Instant::now());
-        state.lock().github.login = Some("octocat".into());
-        assert_eq!(token_for(&state, &repo).unwrap(), token);
-
-        repo.host = "ghe.example.com".into();
-        assert!(matches!(token_for(&state, &repo), Err(Error::Gh(_))));
-
-        let ok: Result<()> = forget_rejected(&state, &token, Err(Error::Gh("HTTP 403".into())));
-        assert!(ok.is_err() && state.lock().github.token.is_some());
-        let _ = forget_rejected::<()>(&state, &token, Err(Error::GhAuth("rejected".into())));
-        assert!(state.lock().github.token.is_none());
-        assert!(state.lock().github.login.is_none());
-    }
-
-    #[test]
-    fn expired_tokens_without_a_refresh_sign_out() {
-        let state = AppState::default();
-        let t0 = Instant::now();
-        state.lock().github.store(
-            github_auth::Grant {
-                refresh: None,
-                refresh_expires_in: None,
-                ..grant("ghu_old", 1)
-            },
-            t0,
-        );
-        state.lock().github.login = Some("octocat".into());
-        let err = tauri::async_runtime::block_on(github_token(&state, &shop_remote())).unwrap_err();
-        assert!(err.to_string().contains("expired"), "{err}");
-        assert!(state.lock().github.login.is_none());
-    }
-
-    #[test]
-    fn refreshes_are_stored_unless_signed_out_meanwhile() {
-        let state = AppState::default();
-        let now = Instant::now();
-        let generation = state.lock().github.generation;
-
-        let token = apply_refresh(
-            &state,
-            generation,
-            Ok(Poll::Done(grant("ghu_new", 28_800))),
-            now,
-        )
-        .unwrap();
-        assert_eq!(token, Token::new("ghu_new"));
-        assert_eq!(
-            state.lock().github.token_state(now),
-            TokenState::Valid(Token::new("ghu_new"))
-        );
-
-        // A network error keeps the session for a later retry.
-        let err = apply_refresh(&state, generation, Err(Error::Gh("offline".into())), now);
-        assert!(matches!(err, Err(Error::Gh(_))));
-        assert!(state.lock().github.token.is_some());
-
-        // GitHub refused the refresh: signed out.
-        let err = apply_refresh(&state, generation, Ok(Poll::Failed("bad".into())), now);
-        assert!(matches!(err, Err(Error::GhAuth(_))));
-        assert!(state.lock().github.token.is_none());
-
-        // Signed out (generation bumped) while refreshing: the new grant is dropped.
-        let stale = generation + 1;
-        state.lock().github.sign_out();
-        let err = apply_refresh(
-            &state,
-            stale - 1,
-            Ok(Poll::Done(grant("ghu_late", 60))),
-            now,
-        );
-        assert!(matches!(err, Err(Error::GhAuth(_))));
-        assert!(state.lock().github.token.is_none());
-    }
-
     #[test]
     fn github_pages_are_built_in_rust() {
         let repo = shop_remote();
@@ -997,11 +853,34 @@ mod tests {
             "https://github.com/acme/shop/settings/environments"
         );
         assert!(github_page_url(&repo, "https://evil.example").is_err());
-        // The install page needs the compiled-in slug.
+        // No GitHub App any more, so no install page.
+        assert!(github_page_url(&repo, "install").is_err());
+    }
+
+    #[test]
+    fn azure_commands_only_target_apps_listed_this_session() {
+        let id = "/subscriptions/0b1f6471-1bf0-4dda-aec3-111122223333/resourceGroups/rg/providers/Microsoft.Web/sites/shop";
+        let state = AppState::new(Inner::default());
+        assert!(matches!(azure_site(&state, id, None), Err(Error::Az(_))));
+        state
+            .lock()
+            .azure_sites
+            .insert(azure::parse_site_id(id).unwrap().session_key());
+        assert_eq!(azure_site(&state, id, None).unwrap().name, "shop");
         assert_eq!(
-            github_page_url(&repo, "install").is_ok(),
-            github_auth::app_slug().is_ok()
+            azure_site(
+                &state,
+                &id.to_uppercase().replace("SUBSCRIPTIONS", "subscriptions"),
+                None
+            )
+            .unwrap()
+            .name,
+            "SHOP",
+            "ids compare case-insensitively"
         );
+        assert!(azure_site(&state, id, Some("staging")).is_ok());
+        assert!(azure_site(&state, id, Some("../x")).is_err());
+        assert!(azure_site(&state, &format!("{id}2"), None).is_err());
     }
 
     #[test]

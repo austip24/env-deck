@@ -1,59 +1,66 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
-  "productName": "EnvDeck",
-  "version": "0.1.0",
-  "identifier": "com.austi.envdeck",
-  "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
-  },
-  "app": {
-    "windows": [
-      {
-        "title": "EnvDeck",
-        "width": 1200,
-        "height": 780,
-        "minWidth": 820,
-        "minHeight": 520,
-        "incognito": true
-      }
-    ],
-    "security": {
-      "csp": {
-        "default-src": "'self'",
-        "script-src": "'self'",
-        "style-src": "'self' 'unsafe-inline'",
-        "img-src": "'self' data:",
-        "font-src": "'self'",
-        "connect-src": "ipc: http://ipc.localhost",
-        "object-src": "'none'",
-        "base-uri": "'none'",
-        "form-action": "'none'",
-        "frame-ancestors": "'none'"
-      }
-    }
-  },
-  "bundle": {
-    "active": true,
-    "targets": [
-      "app",
-      "dmg",
-      "nsis",
-      "msi"
-    ],
-    "category": "DeveloperTool",
-    "shortDescription": "Find, compare and copy local .env and config files",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
-    "publisher": "Austin Pierson",
-    "copyright": "© 2026 Austin Pierson",
-    "longDescription": "EnvDeck finds the .env and config files spread across your projects, shows them with secrets masked, compares them with their templates and copies them where you need them. It keeps no database: the files on disk are the source of truth."
-  }
+	"$schema": "https://schema.tauri.app/config/2",
+	"productName": "EnvDeck",
+	"version": "0.1.0",
+	"identifier": "com.austi.envdeck",
+	"build": {
+		"beforeDevCommand": "npm run dev",
+		"devUrl": "http://localhost:1420",
+		"beforeBuildCommand": "npm run build",
+		"frontendDist": "../dist"
+	},
+	"app": {
+		"windows": [
+			{
+				"title": "EnvDeck",
+				"width": 1200,
+				"height": 780,
+				"minWidth": 820,
+				"minHeight": 520,
+				"incognito": true
+			}
+		],
+		"security": {
+			"csp": {
+				"default-src": "'self'",
+				"script-src": "'self'",
+				"style-src": "'self' 'unsafe-inline'",
+				"img-src": "'self' data:",
+				"font-src": "'self'",
+				"connect-src": "ipc: http://ipc.localhost",
+				"object-src": "'none'",
+				"base-uri": "'none'",
+				"form-action": "'none'",
+				"frame-ancestors": "'none'"
+			}
+		}
+	},
+	"bundle": {
+		"active": true,
+		"createUpdaterArtifacts": true,
+		"targets": ["app", "dmg", "nsis", "msi"],
+		"category": "DeveloperTool",
+		"shortDescription": "Find, compare and copy local .env and config files",
+		"icon": [
+			"icons/32x32.png",
+			"icons/128x128.png",
+			"icons/128x128@2x.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"publisher": "Austin Pierson",
+		"copyright": "© 2026 Austin Pierson",
+		"longDescription": "EnvDeck finds the .env and config files spread across your projects, shows them with secrets masked, compares them with their templates and copies them where you need them. It keeps no database: the files on disk are the source of truth."
+	},
+	"plugins": {
+		"updater": {
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVCNkUwQUZGQ0Q4MTRFMDYKUldRR1RvSE4vd3B1VzZRZHM4dGE0dlVZaWk4aGhYRGdSYldMTzV5dEpxMmd5Q1p3Z1ZBWHFsQmYK",
+			"endpoints": [
+				"https://github.com/austip24/env-deck/releases/latest/download/latest.json"
+			],
+			"windows": {
+				"installMode": "passive"
+			}
+		}
+	}
 }

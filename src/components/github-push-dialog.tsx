@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, ExternalLink, GitBranch, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
+import { ChevronDown, Copy, ExternalLink, GitBranch, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
-import { GithubSignIn } from "@/components/github-sign-in";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,7 +37,6 @@ import {
   errorCode,
   errorText,
   ipc,
-  type GithubAccount,
   type GithubKind,
   type GithubRepoInfo,
   type GithubState,
@@ -52,15 +50,14 @@ const fromTarget = (t: string | null) => t ?? REPO;
 
 type Load =
   | { status: "loading" }
-  | { status: "signIn"; reason: string | null }
   | { status: "ready"; state: GithubState }
   | { status: "error"; code: ReturnType<typeof errorCode>; message: string };
 
 /**
  * Pushes dotenv keys to GitHub Actions secrets or variables, per key, for the repository or one
- * of its existing environments. The user signs in to the EnvDeck GitHub App (memory only); Rust
- * then runs `gh` with that token and re-reads the values from disk. EnvDeck can't create
- * environments (that needs repository admin rights), so it links to the repository's settings.
+ * of its existing environments. Rust runs `gh` with the user's own `gh auth login` (EnvDeck holds
+ * no token and needs no GitHub App, so no organization approval) and re-reads the values from
+ * disk. EnvDeck doesn't create environments, so it links to the repository's settings.
  */
 export function GithubPushDialog({
   open,
@@ -70,58 +67,34 @@ export function GithubPushDialog({
   vars,
   selected,
   revealAll,
+  onPushed,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   sourcePath: string;
   repo: GithubRepoInfo;
   vars: Var[];
-  /** Keys selected in the table; empty means all. */
+  /** Keys to start checked (the table selection); empty means all. */
   selected: ReadonlySet<string>;
   revealAll: boolean;
+  /** Keys that were pushed successfully. */
+  onPushed?: (keys: string[]) => void;
 }) {
   const [remoteName, setRemoteName] = useState(repo.remotes[0]?.remote ?? "");
   const remote = repo.remotes.find((r) => r.remote === remoteName) ?? repo.remotes[0];
   const [load, setLoad] = useState<Load>({ status: "loading" });
-  const [account, setAccount] = useState<GithubAccount | null>(null);
   const [rows, setRows] = useState<PushRow[]>(() => initialRows(vars, selected));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
-
-  const needSignIn = (reason: string | null) => {
-    setAccount((a) => a && { ...a, login: null });
-    setLoad({ status: "signIn", reason });
-  };
-
-  const signOut = async () => {
-    try {
-      setAccount(await ipc.githubSignOut());
-      setLoad({ status: "signIn", reason: null });
-    } catch (e) {
-      toast.error(errorText(e));
-    }
-  };
 
   const inspect = useCallback(
     async (quiet = false) => {
       if (!quiet) setLoad({ status: "loading" });
       try {
-        const acct = await ipc.githubAccount();
-        setAccount(acct);
-        if (!acct.login) {
-          setLoad({ status: "signIn", reason: null });
-          return;
-        }
         const state = await ipc.githubInspect(sourcePath, remoteName);
         setLoad({ status: "ready", state });
       } catch (e) {
-        if (errorCode(e) === "GH_AUTH") needSignIn(errorText(e));
-        else
-          setLoad({
-            status: "error",
-            code: errorCode(e),
-            message: errorText(e),
-          });
+        setLoad({ status: "error", code: errorCode(e), message: errorText(e) });
       }
     },
     [sourcePath, remoteName],
@@ -142,7 +115,7 @@ export function GithubPushDialog({
   const updateChecked = (change: Partial<PushRow>) =>
     setRows((rs) => rs.map((r) => (r.checked ? { ...r, ...change } : r)));
 
-  const openPage = (page: "install" | "environments") =>
+  const openPage = (page: "environments") =>
     void ipc.githubOpenPage(sourcePath, remoteName, page).catch((e) => toast.error(errorText(e)));
 
   const push = async () => {
@@ -153,6 +126,7 @@ export function GithubPushDialog({
       const results = await ipc.githubPush(sourcePath, remoteName, toPushItems(rows));
       const failed = results.filter((r) => r.error !== null);
       const ok = results.length - failed.length;
+      if (ok > 0) onPushed?.(results.filter((r) => r.error === null).map((r) => r.key));
       if (failed.length === 0) {
         toast.success(`Pushed ${ok} to ${state.repo}`);
         onOpenChange(false);
@@ -167,8 +141,7 @@ export function GithubPushDialog({
       await inspect(true);
     } catch (e) {
       const code = errorCode(e);
-      if (code === "GH_AUTH") needSignIn(errorText(e));
-      else if (code === "GH_MISSING" || code === "GH_NOT_INSTALLED") setLoad({ status: "error", code, message: errorText(e) });
+      if (code === "GH_AUTH" || code === "GH_MISSING") setLoad({ status: "error", code, message: errorText(e) });
       else toast.error(errorText(e));
     } finally {
       setBusy(false);
@@ -192,12 +165,9 @@ export function GithubPushDialog({
           </DialogTitle>
           <DialogDescription className="flex flex-wrap items-center gap-x-1">
             <span>Sets Actions secrets or variables. Values are read from the file on disk.</span>
-            {account?.login && (
-              <span className="ml-auto flex items-center gap-1 text-xs">
-                Signed in as <span className="selectable font-medium text-foreground">@{account.login}</span>
-                <Button variant="link" size="xs" className="h-auto px-1" onClick={() => void signOut()} disabled={busy}>
-                  Sign out
-                </Button>
+            {state?.login && (
+              <span className="ml-auto text-xs" title="The account from gh auth login. Switch with gh auth switch.">
+                Using GitHub CLI as <span className="selectable font-medium text-foreground">@{state.login}</span>
               </span>
             )}
           </DialogDescription>
@@ -227,16 +197,11 @@ export function GithubPushDialog({
           </div>
         )}
 
-        {load.status === "signIn" && account && (
-          <GithubSignIn account={account} reason={load.reason} onSignedIn={() => void inspect()} />
-        )}
-
         {load.status === "error" && (
           <GhProblem
             code={load.code}
             message={load.message}
             repo={remote ? `${remote.owner}/${remote.name}` : ""}
-            onInstall={() => openPage("install")}
             onRetry={() => void inspect()}
           />
         )}
@@ -399,52 +364,64 @@ function GhProblem({
   code,
   message,
   repo,
-  onInstall,
   onRetry,
 }: {
   code: ReturnType<typeof errorCode>;
   message: string;
   /** `owner/name`. */
   repo: string;
-  onInstall: () => void;
   onRetry: () => void;
 }) {
-  const notInstalled = code === "GH_NOT_INSTALLED";
+  const setup = code === "GH_MISSING" || code === "GH_AUTH";
   return (
-    <Alert variant={code === "GH_MISSING" || notInstalled ? "default" : "destructive"}>
+    <Alert variant={setup ? "default" : "destructive"}>
       <TriangleAlert />
       <AlertTitle>
         {code === "GH_MISSING"
           ? "GitHub CLI not found"
-          : notInstalled
-            ? `EnvDeck isn't installed on ${repo}`
+          : code === "GH_AUTH"
+            ? "GitHub CLI isn't signed in"
             : "Couldn't read the repository"}
       </AlertTitle>
       <AlertDescription className="selectable space-y-2">
         {code === "GH_MISSING" ? (
           <p>
-            EnvDeck runs the GitHub CLI (<code>gh</code>) with your GitHub sign-in to set secrets and variables. Install
-            it from cli.github.com (no <code>gh auth login</code> needed), then try again.
+            EnvDeck runs the GitHub CLI (<code>gh</code>) with your own GitHub login to set secrets and variables. Install
+            it from cli.github.com, sign in once in a terminal, then try again:
           </p>
-        ) : notInstalled ? (
+        ) : code === "GH_AUTH" ? (
           <p>
-            EnvDeck can only reach repositories where its GitHub App is installed. Install it on {repo} (or on all your
-            repositories), then try again. For an organization's repository, an owner may need to approve the request.
+            EnvDeck uses the GitHub CLI's login, so it works on any repository you can already change, including{" "}
+            {repo || "this one"}, with no app to install or approve. Sign in once in a terminal, then try again:
           </p>
         ) : (
           <p className="break-words">{message}</p>
         )}
+        {setup && <GhLoginCommand />}
         <div className="flex gap-2">
-          {notInstalled && (
-            <Button size="sm" onClick={onInstall}>
-              <ExternalLink /> Install on GitHub
-            </Button>
-          )}
           <Button variant="outline" size="sm" onClick={onRetry}>
             <RefreshCw /> Try again
           </Button>
         </div>
       </AlertDescription>
     </Alert>
+  );
+}
+
+const GH_LOGIN = "gh auth login";
+
+function GhLoginCommand() {
+  const copy = () =>
+    void ipc
+      .writeClipboardText(GH_LOGIN)
+      .then(() => toast.success("Copied command"))
+      .catch((e) => toast.error(errorText(e)));
+  return (
+    <div className="flex items-center gap-1">
+      <code className="selectable rounded-md bg-muted px-2 py-1 font-mono text-xs text-foreground">{GH_LOGIN}</code>
+      <Button variant="ghost" size="icon-sm" aria-label="Copy command" onClick={copy}>
+        <Copy />
+      </Button>
+    </div>
   );
 }

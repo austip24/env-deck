@@ -1,8 +1,8 @@
 //! Errors returned by commands.
 //!
 //! They cross IPC as a plain string (`Display`). Variants the UI needs to react to carry a
-//! stable `CODE: ` prefix (`STALE`, `EXISTS`, `GH_MISSING`, `GH_AUTH`, `GH_NO_CLIENT`,
-//! `GH_NOT_INSTALLED`, `NO_REPO`) that `errorText` in `lib/ipc.ts` can match on.
+//! stable `CODE: ` prefix (`STALE`, `EXISTS`, `GH_MISSING`, `GH_AUTH`, `NO_REPO`,
+//! `AZ_MISSING`, `AZ_AUTH`, `NO_UPDATE`) that `errorText` in `lib/ipc.ts` can match on.
 
 use std::path::{Path, PathBuf};
 
@@ -39,23 +39,28 @@ pub enum Error {
     Native(String),
     #[error("GH_MISSING: The GitHub CLI (gh) isn't installed or couldn't be found")]
     GhMissing,
-    /// Not signed in to GitHub in EnvDeck, or GitHub rejected the token.
+    /// The GitHub CLI isn't signed in to the repository's host, or GitHub rejected its token.
     #[error("GH_AUTH: {0}")]
     GhAuth(String),
-    #[error(
-        "GH_NO_CLIENT: This build of EnvDeck isn't set up for GitHub sign-in. Set ENVDECK_GITHUB_CLIENT_ID and ENVDECK_GITHUB_APP_SLUG in src-tauri/.cargo/config.toml and rebuild."
-    )]
-    GithubNotConfigured,
-    /// The EnvDeck GitHub App isn't installed on the repository (or not for this user).
-    #[error(
-        "GH_NOT_INSTALLED: EnvDeck isn't installed on {0}. Install the EnvDeck GitHub App on it (or ask an owner to), then try again."
-    )]
-    NotInstalled(String),
     #[error("NO_REPO: {0}")]
     NoRepo(String),
     /// `gh` ran and failed; carries its (trimmed) error output.
     #[error("{0}")]
     Gh(String),
+    #[error("AZ_MISSING: The Azure CLI (az) isn't installed or couldn't be found")]
+    AzMissing,
+    /// The Azure CLI isn't signed in, or its sign-in expired.
+    #[error("AZ_AUTH: {0}")]
+    AzAuth(String),
+    /// `az` ran and failed, or an Azure request was refused; carries a short message.
+    #[error("{0}")]
+    Az(String),
+    /// Checking for, downloading or installing an update failed.
+    #[error("Couldn't update EnvDeck: {0}")]
+    Update(String),
+    /// Install was asked for without a check that found an update.
+    #[error("NO_UPDATE: Check for updates first")]
+    NoPendingUpdate,
 }
 
 impl Error {
