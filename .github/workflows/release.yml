@@ -62,6 +62,9 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+          # The repo also has a pnpm-lock.yaml, which tauri-action would pick (and pnpm isn't
+          # installed); build with the npm-installed CLI instead.
+          tauriScript: npx tauri
           includeUpdaterJson: true
           # Windows updates install with the NSIS installer (installMode "passive").
           updaterJsonPreferNsis: true

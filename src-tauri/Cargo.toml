@@ -1,6 +1,6 @@
 [package]
 name = "env-deck"
-version = "0.1.0"
+version = "1.0.0"
 description = "Find, compare and copy local .env and config files"
 authors = ["Austin Pierson"]
 edition = "2024"

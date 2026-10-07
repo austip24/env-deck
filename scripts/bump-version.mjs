@@ -1,6 +1,7 @@
 // Sets EnvDeck's version everywhere it is declared, ahead of tagging a release:
 //   npm run release:version -- 0.2.0
-// The updater compares this version with latest.json, so all of them must agree.
+// The updater compares this version with latest.json, so all of them must agree. Every file is
+// checked before any is written, so a failure leaves them all untouched.
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -13,35 +14,43 @@ if (!version || !SEMVER.test(version)) {
 }
 
 const file = (rel) => fileURLToPath(new URL(`../${rel}`, import.meta.url));
+const read = (rel) => readFileSync(file(rel), "utf8");
 
-/** Replaces exactly one match of `re` in `rel`; fails loudly otherwise. */
-function replaceOnce(rel, re, to) {
-  const text = readFileSync(file(rel), "utf8");
-  const matches = text.match(new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g"));
-  if (matches?.length !== 1) {
-    console.error(`bump-version: expected one version in ${rel}, found ${matches?.length ?? 0}`);
-    process.exit(1);
-  }
-  writeFileSync(file(rel), text.replace(re, to));
+function fail(message) {
+  console.error(`bump-version: ${message}; no files were changed`);
+  process.exit(1);
 }
 
-/** Rewrites a JSON file, keeping 2-space indentation and its line endings. */
-function setJsonVersion(rel, edit) {
-  const text = readFileSync(file(rel), "utf8");
+/** Replaces exactly one match of `re` (no `g` flag) in `rel`. */
+function replaceOnce(rel, re, to) {
+  const text = read(rel);
+  const count = text.match(new RegExp(re.source, re.flags + "g"))?.length ?? 0;
+  if (count !== 1) fail(`expected one version in ${rel}, found ${count}`);
+  return [rel, text.replace(re, to)];
+}
+
+/** Rewrites a JSON file, keeping its indentation (tabs or spaces) and line endings. */
+function editJson(rel, edit) {
+  const text = read(rel);
   const json = JSON.parse(text);
   edit(json);
+  const indent = /^\{\r?\n([ \t]+)/.exec(text)?.[1] ?? "  ";
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  writeFileSync(file(rel), (JSON.stringify(json, null, 2) + "\n").replace(/\n/g, eol));
+  return [rel, (JSON.stringify(json, null, indent) + "\n").replace(/\n/g, eol)];
 }
 
-setJsonVersion("package.json", (j) => (j.version = version));
-setJsonVersion("package-lock.json", (j) => {
-  j.version = version;
-  if (j.packages?.[""]) j.packages[""].version = version;
-});
-// tauri.conf.json is edited as text to keep its formatting.
-replaceOnce("src-tauri/tauri.conf.json", /^(  "version": )"[^"]*"/m, `$1"${version}"`);
-replaceOnce("src-tauri/Cargo.toml", /^(version = )"[^"]*"/m, `$1"${version}"`);
-replaceOnce("src-tauri/Cargo.lock", /(name = "env-deck"\r?\nversion = )"[^"]*"/, `$1"${version}"`);
+const edits = [
+  editJson("package.json", (j) => (j.version = version)),
+  editJson("package-lock.json", (j) => {
+    j.version = version;
+    if (j.packages?.[""]) j.packages[""].version = version;
+  }),
+  // The app's version as Tauri and the updater see it. Edited as text to keep its formatting;
+  // the top-level "version" is the first one in the file.
+  replaceOnce("src-tauri/tauri.conf.json", /^([ \t]*"version"\s*:\s*)"[^"]*"/m, `$1"${version}"`),
+  replaceOnce("src-tauri/Cargo.toml", /^(version = )"[^"]*"/m, `$1"${version}"`),
+  replaceOnce("src-tauri/Cargo.lock", /(name = "env-deck"\r?\nversion = )"[^"]*"/, `$1"${version}"`),
+];
+for (const [rel, text] of edits) writeFileSync(file(rel), text);
 
 console.log(`bump-version: ${version}. Commit, then tag v${version} and push the tag.`);
